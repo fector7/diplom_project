@@ -1,0 +1,20 @@
+---
+- name: Create Kibana index pattern filebeat-*
+  uri:
+    url: "http://localhost:5601/api/saved_objects/index-pattern/filebeat-*"
+    method: POST
+    headers: { kbn-xsrf: "true", Content-Type: "application/json" }
+    body:
+      attributes: { title: "filebeat-*", timeFieldName: "@timestamp" }
+    body_format: json
+    status_code: [200, 409]
+
+- name: Create Kibana index pattern logs-*
+  uri:
+    url: "http://localhost:5601/api/saved_objects/index-pattern/logs-*"
+    method: POST
+    headers: { kbn-xsrf: "true", Content-Type: "application/json" }
+    body:
+      attributes: { title: "logs-*", timeFieldName: "@timestamp" }
+    body_format: json
+    status_code: [200, 409]

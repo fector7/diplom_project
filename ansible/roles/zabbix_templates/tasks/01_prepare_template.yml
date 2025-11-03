@@ -1,0 +1,108 @@
+---
+- name: Get Zabbix group ID for Linux servers
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "hostgroup.get"
+      params: { filter: { name: ["Linux servers"] } }
+      auth: "{{ auth_token }}"
+      id: 2
+  register: zbx_group
+
+- name: Get fallback Yandex Cloud VMs group ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "hostgroup.get"
+      params: { filter: { name: ["Yandex Cloud VMs"] } }
+      auth: "{{ auth_token }}"
+      id: 2_fallback
+  register: yandex_group
+  when: zbx_group.json.result | length == 0
+  ignore_errors: true
+
+- name: Set group id fallback to Yandex Cloud VMs if not found
+  set_fact:
+    zbx_group_id: >-
+      {{
+        (zbx_group.json.result[0].groupid if zbx_group.json.result | length > 0 else
+         (yandex_group.json.result[0].groupid if yandex_group.json.result | length > 0 else fail_msg))
+      }}
+  vars:
+    fail_msg: "No 'Linux servers' or 'Yandex Cloud VMs' group found."
+
+- name: Create USE_Monitoring_Template
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "template.create"
+      params:
+        host: "USE_Monitoring_Template"
+        groups: [ { groupid: "{{ zbx_group_id }}" } ]
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "all" }
+          - { tag: "environment", value: "Yandex Cloud" }
+      auth: "{{ auth_token }}"
+      id: 3
+  register: template_creation
+  failed_when: template_creation.json.error is defined and ('already exists' not in template_creation.json.error.data)
+
+- name: Get USE_Monitoring_Template ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "template.get"
+      params: { filter: { host: ["USE_Monitoring_Template"] } }
+      auth: "{{ auth_token }}"
+      id: 4
+  register: use_template
+
+- name: Set template id
+  set_fact:
+    use_template_id: "{{ use_template.json.result[0].templateid }}"
+
+- name: Ensure USE threshold macros on template
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "template.massupdate"
+      params:
+        templates: [{ "templateid": "{{ use_template_id }}" }]
+        macros:
+          - { macro: "{$CPU_UTIL_HIGH}",   value: "75" }
+          - { macro: "{$CPU_UTIL_CRIT}",   value: "85" }
+          - { macro: "{$CPU_LOAD_SAT}", value: "2.0" }
+          - { macro: "{$RAM_UTIL_HIGH}",   value: "70" }
+          - { macro: "{$RAM_UTIL_CRIT}",   value: "85" }
+          - { macro: "{$DISK_PUSED_HIGH}", value: "60" }
+          - { macro: "{$DISK_PUSED_CRIT}", value: "80" }
+          - { macro: "{$DISK_UTIL_CLOUD}",      value: "20" }
+          - { macro: "{$DISK_READ_AWAIT_CRIT}", value: "35" }
+          - { macro: "{$DISK_WRITE_AWAIT_CRIT}", value: "60" }
+          - { macro: "{$HTTP_TIME_WARN}",  value: "1500" }
+          - { macro: "{$HTTP_TIME_CRIT}",  value: "3000" }
+          - { macro: "{$NET_DROPPED_THRESH}", value: "10" }
+          - { macro: "{$SWAP_FREE_LOW}", value: "20" }
+          - { macro: "{$NET_RETRANS_PPS}", value: "5" }
+          - { macro: "{$NET_CONN_HIGH}",  value: "1000" }
+          - { macro: "{$HTTP_ERRORS_EN}", value: "0" }
+      auth: "{{ auth_token }}"
+      id: 41
+  register: ensure_macros
+  failed_when: false

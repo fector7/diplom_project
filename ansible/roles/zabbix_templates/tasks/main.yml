@@ -1,0 +1,54 @@
+---
+- name: Authenticate with Zabbix API
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "user.login"
+      params: { user: "{{ zabbix_api_user }}", password: "{{ zabbix_api_pass }}" }
+      id: 1
+  register: zbx_auth
+  no_log: true
+
+- name: Set initial auth_token fact
+  set_fact:
+    auth_token: "{{ zbx_auth.json.result }}"
+  no_log: true
+
+- name: Prepare Template and Base Entities
+  import_tasks: 01_prepare_template.yml
+
+- name: Create Static Items and Triggers
+  import_tasks: 02_static_items.yml
+
+- name: Refresh token before LLD operations
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "user.login"
+      params: { user: "{{ zabbix_api_user }}", password: "{{ zabbix_api_pass }}" }
+      id: 12
+  register: zbx_auth_refreshed
+  no_log: true
+
+- name: Set refreshed auth_token fact
+  set_fact:
+    auth_token: "{{ zbx_auth_refreshed.json.result }}"
+  no_log: true
+
+- name: Create LLD for Block Devices
+  import_tasks: 03_lld_block_devices.yml
+
+- name: Create LLD for Network Interfaces
+  import_tasks: 04_lld_network.yml
+
+- name: Create LLD for Filesystems
+  import_tasks: 05_lld_filesystems.yml
+
+- name: Create HTTP Monitoring
+  import_tasks: 07_http_monitoring.yml

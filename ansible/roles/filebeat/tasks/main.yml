@@ -1,0 +1,60 @@
+
+- name: Ensure Filebeat config dir
+  file:
+    path: /etc/filebeat
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Render filebeat.yml
+  template:
+    src: filebeat.yml.j2
+    dest: /etc/filebeat/filebeat.yml
+    mode: '0644'
+  notify: Restart filebeat
+  become: yes
+
+- name: Ensure Filebeat data dir
+  file:
+    path: /var/lib/filebeat-data
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Build Filebeat volume list
+  set_fact:
+    filebeat_volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "/var/lib/docker/containers:/var/lib/docker/containers:ro"
+      - "/var/log:/var/log:ro"
+      - "/var/log/zabbix:/var/log/zabbix:ro"
+      - "/etc/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro"
+      - "/var/lib/filebeat-data:/usr/share/filebeat/data:rw"
+  become: yes
+
+- name: Add nginx logs on web nodes
+  set_fact:
+    filebeat_volumes: "{{ filebeat_volumes + ['/var/log/nginx:/var/log/nginx:ro'] }}"
+  when: "'web' in group_names"
+  become: yes
+
+- name: Add apache logs on monitoring nodes
+  set_fact:
+    filebeat_volumes: "{{ filebeat_volumes + ['/var/log/apache2:/var/log/apache2:ro'] }}"
+  when: "'monitoring' in group_names"
+  become: yes
+
+- name: Run Filebeat container
+  community.docker.docker_container:
+    name: filebeat
+    image: elastic/filebeat:7.17.9
+    state: started
+    restart_policy: always
+    command: -c /usr/share/filebeat/filebeat.yml --strict.perms=false
+    user: root
+    hostname: "{{ inventory_hostname }}"
+    network_mode: "{{ 'host' if (inventory_hostname is match('^elasticsearch(\\..*)?$')) else omit }}"
+    volumes: "{{ filebeat_volumes }}"
+    labels:
+      com.filebeat.enabled: "true"
+  become: yes

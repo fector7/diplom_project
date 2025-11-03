@@ -1,0 +1,125 @@
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths: [/var/log/syslog]
+    fields: { service: system-syslog, type: system }
+    tags: ["system","general","ubuntu"]
+
+  - type: log
+    enabled: true
+    paths: [/var/log/auth.log]
+    fields: { service: system-auth, type: security }
+    tags: ["system","security","general","ubuntu"]
+
+  - type: log
+    enabled: true
+    paths: [/var/log/kern.log]
+    fields: { service: system-kernel, type: system }
+    tags: ["system","kernel","general","ubuntu"]
+
+  - type: log
+    enabled: true
+    paths: [/var/log/zabbix/zabbix_agentd.log]
+    fields: { service: zabbix-agent, type: monitoring }
+    tags: ["zabbix","agent","monitoring"]
+
+{% if 'web' in group_names %}
+  - type: log
+    enabled: true
+    paths: [/var/log/nginx/access.log]
+    fields: { service: nginx, log_type: access, type: web }
+    tags: ["nginx","web","access"]
+
+  - type: log
+    enabled: true
+    paths: [/var/log/nginx/error.log]
+    fields: { service: nginx, log_type: error, type: web }
+    tags: ["nginx","web","error"]
+{% endif %}
+
+{% if 'monitoring' in group_names and (inventory_hostname is match('^zabbix-server\\..*') or inventory_hostname is match('^zabbix-server$')) %}
+  - type: log
+    enabled: true
+    paths: [/var/log/zabbix/zabbix_server.log]
+    fields: { service: zabbix-server, type: application }
+    tags: ["zabbix","monitoring","application"]
+    multiline.pattern: '^\s*\d+:\d{8}:\d{6}\.\d{3}\s'
+    multiline.negate: true
+    multiline.match: after
+{% endif %}
+
+{% if 'monitoring' in group_names and (inventory_hostname is match('^zabbix-web\\..*') or inventory_hostname is match('^zabbix-web$')) %}
+  - type: log
+    enabled: true
+    paths: [/var/log/apache2/access.log]
+    fields: { service: zabbix-web-apache, log_type: access, type: web }
+    tags: ["apache","zabbix-web","web","access"]
+
+  - type: log
+    enabled: true
+    paths: [/var/log/apache2/error.log]
+    fields: { service: zabbix-web-apache, log_type: error, type: web }
+    tags: ["apache","zabbix-web","web","error"]
+{% endif %}
+
+{% if 'logging' in group_names and (inventory_hostname is match('^elasticsearch\\..*') or inventory_hostname is match('^elasticsearch$')) %}
+  - type: log
+    enabled: true
+    paths: [/var/log/elasticsearch/*.log]
+    fields: { service: elasticsearch, type: application }
+    tags: ["elasticsearch","logging","application"]
+    multiline.pattern: '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+    multiline.negate: true
+    multiline.match: after
+{% endif %}
+
+{% if 'logging' in group_names and (inventory_hostname is match('^kibana\\..*') or inventory_hostname is match('^kibana$')) %}
+  - type: log
+    enabled: true
+    paths: [/var/log/kibana/*.log]
+    fields: { service: kibana, type: application }
+    tags: ["kibana","logging","application"]
+{% endif %}
+
+  - type: container
+    enabled: true
+    stream: all
+    paths:
+      - /var/lib/docker/containers/*/*-json.log
+    processors:
+      - add_docker_metadata: {}
+      - drop_event:
+          when:
+            not:
+              equals:
+                container.name: "elasticsearch"
+
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      hints.enabled: true
+      hints.default_config:
+        type: container
+        paths:
+          - "/var/lib/docker/containers/${data.docker.container.id}/*-json.log"
+        fields:
+          service: docker-container-default
+          type: container
+
+logging.to_stderr: true
+logging.metrics.enabled: false
+logging.level: info
+
+output.elasticsearch:
+  hosts:
+{% if inventory_hostname is match('^elasticsearch(\\..*)?$') %}
+    - "http://127.0.0.1:9200"
+{% else %}
+    {{ (fb_output_host if (fb_output_host is sequence and not (fb_output_host is string)) else [fb_output_host]) | to_json }}
+{% endif %}
+
+processors:
+  - add_host_metadata: ~
+  - add_docker_metadata: {}
+  - add_cloud_metadata: {}
+

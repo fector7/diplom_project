@@ -1,0 +1,7 @@
+# Файл: ansible/roles/zabbix_web/handlers/main.yml
+---
+- name: restart apache
+  systemd:
+    name: apache2
+    state: restarted
+  become: yes

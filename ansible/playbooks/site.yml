@@ -1,0 +1,80 @@
+# Файл: ansible/playbooks/site.yml
+
+---
+- name: Wait for instances to be fully ready
+  hosts: all
+  gather_facts: false
+  tasks:
+  - name: Wait for SSH connection
+    wait_for_connection:
+      timeout: 300
+      
+- name: Install Docker on all hosts
+  hosts: all
+  become: yes
+  tags: docker
+  roles:
+   - docker_install
+
+- name: Install Zabbix Server
+  hosts: zabbix-server.ru-central1.internal
+  become: yes
+  roles:
+    - zabbix_server
+
+- name: Install Zabbix Web Frontend
+  hosts: zabbix-web.ru-central1.internal
+  become: yes
+  roles:
+    - zabbix_web
+      
+- name: Install Zabbix Agent on all servers
+  hosts: all
+  become: yes
+  tags: agents
+  roles:
+    - zabbix_agent
+
+- name: Create Zabbix dashboards
+  hosts: zabbix-web.ru-central1.internal
+  become: yes
+  roles:
+    - zabbix_dashboard
+
+- name: Install Elasticsearch
+  hosts: elasticsearch.ru-central1.internal
+  become: yes
+  roles:
+    - elasticsearch_install
+
+- name: Install Kibana
+  hosts: kibana.ru-central1.internal
+  become: yes
+  roles:
+    - kibana_install 
+
+- name: Wait for Kibana to be ready
+  hosts: kibana.ru-central1.internal
+  tags: logging
+  tasks:
+    - name: Check Kibana API
+      uri:
+        url: "http://localhost:5601/api/status"
+        status_code: 200
+      register: kibana_check
+      until: kibana_check.status == 200
+      retries: 12
+      delay: 30
+
+- name: Deploy Filebeat container on all servers
+  hosts: all
+  become: yes
+  tags: agents
+  roles:
+    - { role: filebeat, vars: { fb_output_host: "elasticsearch.ru-central1.internal:9200" } }
+
+- name: Create Kibana index pattern
+  hosts: kibana.ru-central1.internal
+  tags: logging
+  roles:
+    - kibana_setup 

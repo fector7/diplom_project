@@ -1,0 +1,160 @@
+---
+- name: Download Zabbix repository
+  apt:
+    deb: "https://repo.zabbix.com/zabbix/6.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.0-4+ubuntu22.04_all.deb"
+  become: yes
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Zabbix frontend and dependencies
+  apt:
+    name:
+      - zabbix-frontend-php
+      - apache2
+      - php-pgsql
+      - zabbix-apache-conf
+    state: present
+  become: yes
+  notify: restart apache
+
+- name: Deploy zabbix.conf.php
+  template:
+    src: zabbix.conf.php.j2
+    dest: /etc/zabbix/web/zabbix.conf.php
+    owner: www-data
+    group: www-data
+    mode: '0640'
+  become: yes
+  notify: restart apache
+
+- name: Ensure Apache is started and enabled
+  systemd:
+    name: apache2
+    state: started
+    enabled: yes
+  become: yes
+
+- name: Flush handlers
+  meta: flush_handlers
+
+- name: Wait for Zabbix API
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: { "jsonrpc": "2.0", "method": "apiinfo.version", "params": [], "id": 1 }
+    status_code: 200
+  register: zabbix_api_check
+  until: zabbix_api_check.status == 200
+  retries: 20
+  delay: 10
+
+- name: Login with default password
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: { "jsonrpc": "2.0", "method": "user.login", "params": { "user": "Admin", "password": "zabbix" }, "id": 1 }
+    status_code: 200
+  register: zbx_auth_default
+  ignore_errors: yes
+
+- name: Change default password
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "user.update"
+      params: { "userid": "1", "passwd": "{{ zabbix_api_pass }}" }
+      auth: "{{ zbx_auth_default.json.result }}"
+      id: 2
+    status_code: 200
+  when: zbx_auth_default.json is defined and zbx_auth_default.json.result is defined
+
+- name: Final login to get auth token
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: { "jsonrpc": "2.0", "method": "user.login", "params": { "user": "{{ zabbix_api_user }}", "password": "{{ zabbix_api_pass }}" }, "id": 1 }
+    status_code: 200
+  register: zbx_auth
+  until: zbx_auth.json is defined and zbx_auth.json.result is defined
+  retries: 5
+  delay: 5
+
+- name: Get 'Linux servers' group ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "hostgroup.get"
+      params:
+        filter:
+          name: ["Linux servers"]
+      auth: "{{ zbx_auth.json.result }}"
+      id: 101
+  register: zbx_group
+
+- name: Create and configure custom templates and link them
+  include_role:
+    name: zabbix_templates
+  vars:
+    auth_token: "{{ zbx_auth.json.result }}"
+    zbx_group_id: "{{ zbx_group.json.result[0].groupid }}"
+
+- name: Create web scenarios
+  include_role:
+    name: zabbix_webscenario
+  vars:
+    auth_token: "{{ zbx_auth.json.result }}"
+    alb_ip: "{{ hostvars['localhost']['alb_ip'] }}"
+    zbx_group_id: "{{ zbx_group.json.result[0].groupid }}"
+
+- name: Get 'USE_Monitoring_Template' custom template ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "template.get"
+      params:
+        filter:
+          host: ["USE_Monitoring_Template"]
+      auth: "{{ zbx_auth.json.result }}"
+      id: 202
+  register: zbx_use_template
+
+- name: Create Auto-registration action
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "action.create"
+      params:
+        name: "Auto registration for Linux"
+        eventsource: 2
+        status: 0
+        filter:
+          evaltype: 1
+          conditions:
+            - { "conditiontype": 24, "operator": 8, "value": "linux" }
+        operations:
+          - { "operationtype": 4, "opgroup": [{ "groupid": "{{ zbx_group.json.result[0].groupid }}" }] }
+          - { "operationtype": 6, "optemplate": [
+                { "templateid": "{{ zbx_use_template.json.result[0].templateid }}" }
+              ] }
+      auth: "{{ zbx_auth.json.result }}"
+      id: 203
+  when: zbx_use_template.json.result | length > 0
+  ignore_errors: yes

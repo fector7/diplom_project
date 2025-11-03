@@ -1,0 +1,283 @@
+---
+- name: Set template defaults
+  set_fact:
+    zbx_template_name: "{{ zbx_template_name | default('USE_Monitoring_Template') }}"
+    zbx_http_scheme:   "{{ zbx_http_scheme   | default('http') }}"
+    zbx_http_path:     "{{ zbx_http_path     | default('/') }}"
+    zbx_http_delay:    "{{ zbx_http_delay    | default('30s') }}"
+  changed_when: false
+
+- name: Get WEB_ROOT scenario
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "httptest.get"
+      params:
+        output: ["httptestid","name","hostid"]
+        hostids: ["{{ use_template_id }}"]
+        filter: { name: "WEB_ROOT" }
+      auth: "{{ auth_token }}"
+      id: 8001
+  register: web_root_get
+  changed_when: false
+  failed_when: false
+
+- name: Create WEB_ROOT scenario
+  when: web_root_get.json.result | length == 0
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: |
+      {
+        "jsonrpc": "2.0",
+        "method": "httptest.create",
+        "params": {
+          "name": "WEB_ROOT",
+          "delay": "{{ zbx_http_delay }}",
+          "hostid": "{{ use_template_id }}",
+          "steps": [
+            {
+              "name": "GET_/",
+              "url": "{{ zbx_http_scheme }}://{HOST.CONN}{{ zbx_http_path }}",
+              "follow_redirects": 1,
+              "status_codes": "200",
+              "timeout": "15s",
+              "no": 1
+            }
+          ]
+        },
+        "auth": "{{ auth_token }}",
+        "id": 8002
+      }
+  register: web_root_create
+  failed_when: web_root_create.json.error is defined and ('already exists' not in (web_root_create.json.error.data | default('')))
+
+- name: Create HTTP p95 response time item
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "HTTP response time p95, ms (5m)"
+        key_: "use.http.time.p95[WEB_ROOT]"
+        type: 15
+        value_type: 0
+        units: "ms"
+        params: "percentile(//web.test.time[WEB_ROOT,GET_/,resp],5m,95)*1000"
+        delay: "1m"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 8003
+  register: http_p95
+  failed_when: http_p95.json.error is defined and ('already exists' not in (http_p95.json.error.data | default('')))
+
+- name: Ensure HTTP p95 itemid
+  when: http_p95.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        output: ["itemid","key_"]
+        hostids: ["{{ use_template_id }}"]
+        filter: { key_: "use.http.time.p95[WEB_ROOT]" }
+      auth: "{{ auth_token }}"
+      id: 8004
+  register: http_p95_get
+  changed_when: false
+  failed_when: false
+
+- name: Set http_p95_itemid fact
+  set_fact:
+    http_p95_itemid: >-
+      {{
+        (http_p95.json.result.itemids[0]
+          if (http_p95.json is defined and http_p95.json.result is defined and (http_p95.json.result.itemids | length) > 0)
+          else (http_p95_get.json.result[0].itemid if (http_p95_get.json.result | length) > 0 else '')
+        )
+      }}
+  changed_when: false
+
+- name: Create HTTP fail last item
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "HTTP fail last"
+        key_: "use.http.fail.last[WEB_ROOT]"
+        type: 15
+        value_type: 3
+        delay: "1m"
+        params: "last(//web.test.fail[WEB_ROOT])"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "use_type", value: "Errors" }
+      auth: "{{ auth_token }}"
+      id: 8060
+  register: http_fail_last
+  failed_when: http_fail_last.json.error is defined and ('already exists' not in (http_fail_last.json.error.data | default('')))
+
+- name: Ensure HTTP fail last itemid
+  when: http_fail_last.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        output: ["itemid","key_","params"]
+        hostids: ["{{ use_template_id }}"]
+        filter: { key_: "use.http.fail.last[WEB_ROOT]" }
+      auth: "{{ auth_token }}"
+      id: 8061
+  register: http_fail_last_get
+  changed_when: false
+  failed_when: false
+
+- name: Set http_fail_last_itemid fact
+  set_fact:
+    http_fail_last_itemid: >-
+      {{
+        (http_fail_last.json.result.itemids[0]
+          if (http_fail_last.json is defined and http_fail_last.json.result is defined and (http_fail_last.json.result.itemids | length) > 0)
+          else (http_fail_last_get.json.result[0].itemid if (http_fail_last_get.json.result | length) > 0 else '')
+        )
+      }}
+  changed_when: false
+
+- name: Update formula of HTTP fail last if exists
+  when: http_fail_last.json.error is defined and ('already exists' in (http_fail_last.json.error.data | default('')))
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.update"
+      params:
+        itemid: "{{ http_fail_last_itemid }}"
+        params: "last(//web.test.fail[WEB_ROOT])"
+      auth: "{{ auth_token }}"
+      id: 8062
+
+- name: Create HTTP triggers
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "HTTP p95 > {$HTTP_TIME_WARN} ms (5m)",
+          expression: "last(/{{ zbx_template_name }}/use.http.time.p95[WEB_ROOT])>{$HTTP_TIME_WARN}",
+          priority: 2,
+          tags: [ { tag: "scope", "value": "USE" }, { tag: "resource", "value": "http" }, { tag: "use_type", "value": "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 8071 }
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "HTTP p95 > {$HTTP_TIME_CRIT} ms (5m)",
+          expression: "last(/{{ zbx_template_name }}/use.http.time.p95[WEB_ROOT])>{$HTTP_TIME_CRIT}",
+          priority: 4,
+          tags: [ { tag: "scope", "value": "USE" }, { tag: "resource", "value": "http" }, { tag: "use_type", "value": "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 8072 }
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "HTTP check failed (Errors)",
+          expression: "max(/{{ zbx_template_name }}/use.http.fail.last[WEB_ROOT],5m)>0 and {$HTTP_ERRORS_EN}=1",
+          priority: 3,
+          tags: [ { tag: "scope", "value": "USE" }, { tag: "resource", "value": "http" }, { tag: "use_type", "value": "Errors" } ]
+        },
+        auth: "{{ auth_token }}", id: 8073 }
+  register: http_triggers
+  failed_when: false
+  loop_control: { loop_var: item }
+
+- name: Get HTTP CRIT/WARN trigger ids
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.get"
+      params:
+        output: ["triggerid","description"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          description:
+            - "HTTP p95 > {$HTTP_TIME_CRIT} ms (5m)"
+            - "HTTP p95 > {$HTTP_TIME_WARN} ms (5m)"
+      auth: "{{ auth_token }}"
+      id: 8074
+  register: http_tw
+  changed_when: false
+  failed_when: false
+
+- name: Update dependency WARN -> CRIT
+  when: http_tw.json.result | length >= 2
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.update"
+      params:
+        triggerid: "{{ (http_tw.json.result | selectattr('description','search','WARN') | list)[0].triggerid }}"
+        dependencies:
+          - triggerid: "{{ (http_tw.json.result | selectattr('description','search','CRIT') | list)[0].triggerid }}"
+      auth: "{{ auth_token }}"
+      id: 8075
+
+- name: Create graph for HTTP WEB_ROOT (Saturation/Errors)
+  when:
+    - http_p95_itemid is defined
+    - http_p95_itemid != ''
+    - http_fail_last_itemid is defined
+    - http_fail_last_itemid != ''
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graph.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "HTTP WEB_ROOT Metrics (Saturation/Errors)"
+        width: 900
+        height: 200
+        yaxismin: 0
+        gitems:
+          - { color: "1A7C11", itemid: "{{ http_p95_itemid }}",       yaxisside: 0, drawtype: 0, type: 0 }
+          - { color: "F63100", itemid: "{{ http_fail_last_itemid }}",  yaxisside: 1, drawtype: 0, type: 0 }
+      auth: "{{ auth_token }}"
+      id: 8076
+  register: http_graph
+  failed_when: http_graph.json.error is defined and ('already exists' not in (http_graph.json.error.data | default('')))
+

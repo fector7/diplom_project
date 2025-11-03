@@ -1,0 +1,372 @@
+---
+- name: Defaults
+  set_fact:
+    alb_service_host_tech: "{{ alb_service_host_tech | default('service-frontend-alb') }}"
+    alb_service_host:      "{{ alb_service_host      | default('Service: Frontend (ALB)') }}"
+    alb_delay:             "{{ alb_delay             | default('10s') }}"
+    alb_url_path:          "{{ alb_url_path          | default('/') }}"
+  changed_when: false
+
+
+- name: Ensure service host exists
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "host.create"
+      params:
+        host: "{{ alb_service_host_tech }}"
+        name: "{{ alb_service_host }}"
+        status: 0
+        groups: [{ "groupid": "{{ zbx_group_id }}" }]
+        interfaces: []
+      auth: "{{ auth_token }}"
+      id: 11
+  register: alb_host_create
+  failed_when: alb_host_create.json.error is defined and ('already exists' not in (alb_host_create.json.error.data | default('')))
+
+- name: Get service hostid
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "host.get"
+      params:
+        filter: { host: ["{{ alb_service_host_tech }}"] }
+        output: ["hostid","host","name"]
+      auth: "{{ auth_token }}"
+      id: 12
+  register: alb_host
+  failed_when: alb_host.json.result | length == 0
+
+- name: Set service hostid
+  set_fact:
+    alb_hostid: "{{ alb_host.json.result[0].hostid }}"
+  changed_when: false
+
+
+- name: Ensure web scenario 'WEB_ROOT' exists on service host
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: |
+      {
+        "jsonrpc": "2.0",
+        "method": "httptest.create",
+        "params": {
+          "name": "WEB_ROOT",
+          "hostid": "{{ alb_hostid }}",
+          "delay": "{{ alb_delay }}",
+          "steps": [{
+            "name": "GET_/",
+            "url": "http://{{ alb_ip }}{{ alb_url_path }}",
+            "status_codes": "200,301,302",
+            "timeout": "15s",
+            "no": 1
+          }]
+        },
+        "auth": "{{ auth_token }}",
+        "id": 13
+      }
+  register: web_scn
+  failed_when: web_scn.json.error is defined and ('already exists' not in (web_scn.json.error.data | default('')))
+
+
+- name: Set ALB HTTP fail key (fixed)
+  set_fact:
+    alb_http_fail_key: "web.test.fail[WEB_ROOT]"
+  changed_when: false
+
+
+- name: Create calculated item on ALB HTTP response time p95, ms (5m)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ alb_hostid }}"
+        name: "HTTP response time p95, ms (5m)"
+        key_: "use.http.time.p95[WEB_ROOT]"
+        type: 15
+        value_type: 0
+        units: "ms"
+        params: "percentile(//web.test.time[WEB_ROOT,GET_/,resp],5m,95)*1000"
+        delay: "{{ alb_delay }}"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 1301
+  register: alb_http_p95_item
+  failed_when: alb_http_p95_item.json.error is defined and ('already exists' not in (alb_http_p95_item.json.error.data | default('')))
+
+- name: Ensure p95 itemid (fetch if existed)
+  when: alb_http_p95_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        hostids: ["{{ alb_hostid }}"]
+        filter: { key_: ["use.http.time.p95[WEB_ROOT]"] }
+        output: ["itemid"]
+      auth: "{{ auth_token }}"
+      id: 1302
+  register: alb_http_p95_get
+  changed_when: false
+  failed_when: false
+
+- name: Set p95 itemid fact for ALB
+  set_fact:
+    alb_http_p95_itemid: >-
+      {{
+        (alb_http_p95_item.json.result.itemids[0]
+          if (alb_http_p95_item.json is defined and alb_http_p95_item.json.result is defined and (alb_http_p95_item.json.result.itemids | length) > 0)
+          else (alb_http_p95_get.json.result[0].itemid if (alb_http_p95_get.json.result | length) > 0 else '')
+        )
+      }}
+  changed_when: false
+
+- name: Ensure ALB HTTP fail mirror item
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ alb_hostid }}"
+        name: "HTTP fail last (mirror)"
+        key_: "use.http.fail.last[WEB_ROOT]"
+        type: 15
+        value_type: 3
+        delay: "{{ alb_delay }}"
+        params: "last(//web.test.fail[WEB_ROOT])"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "use_type", value: "Errors" }
+      auth: "{{ auth_token }}"
+      id: 1306
+  register: alb_http_fail_mirror
+  failed_when: alb_http_fail_mirror.json.error is defined and ('already exists' not in (alb_http_fail_mirror.json.error.data | default('')))
+
+- name: Get ALB HTTP fail mirror itemid (if existed)
+  when: alb_http_fail_mirror.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        hostids: ["{{ alb_hostid }}"]
+        filter: { key_: "use.http.fail.last[WEB_ROOT]" }
+        output: ["itemid"]
+      auth: "{{ auth_token }}"
+      id: 1307
+  register: alb_http_fail_mirror_get
+  changed_when: false
+  failed_when: false
+
+- name: Set fact for ALB HTTP fail mirror itemid
+  set_fact:
+    alb_http_fail_mirror_itemid: >-
+      {{
+        (alb_http_fail_mirror.json.result.itemids[0]
+          if (alb_http_fail_mirror.json is defined and alb_http_fail_mirror.json.result is defined
+              and (alb_http_fail_mirror.json.result.itemids | length) > 0)
+          else (alb_http_fail_mirror_get.json.result[0].itemid if (alb_http_fail_mirror_get.json.result | length) > 0 else '')
+        )
+      }}
+  changed_when: false
+
+- name: ALB HTTP availability %, (5m)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ alb_hostid }}"
+        name: "HTTP availability %, (5m)"
+        key_: "use.http.avail.pct[WEB_ROOT]"
+        type: 15
+        value_type: 0
+        units: "%"
+        delay: "{{ alb_delay }}"
+        params: "(1 - avg(//web.test.fail[WEB_ROOT],5m)) * 100"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "use_type", value: "Errors" }
+      auth: "{{ auth_token }}"
+      id: 1304
+  register: alb_http_avail_item
+  failed_when: alb_http_avail_item.json.error is defined and ('already exists' not in (alb_http_avail_item.json.error.data | default('')))
+
+
+- name: Ensure ALB HTTP WEB_ROOT Metrics (Saturation/Errors) graph exists
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graph.create"
+      params:
+        hostid: "{{ alb_hostid }}"
+        name: "HTTP WEB_ROOT Metrics (Saturation/Errors)"
+        width: 900
+        height: 200
+        yaxismin: 0
+        gitems:
+          - { color: "1A7C11", itemid: "{{ alb_http_p95_itemid }}",         yaxisside: 0, drawtype: 0, type: 0 }
+          - { color: "F63100", itemid: "{{ alb_http_fail_mirror_itemid }}", yaxisside: 1, drawtype: 0, type: 0 }
+      auth: "{{ auth_token }}"
+      id: 1308
+  register: alb_http_combined_graph
+  failed_when: alb_http_combined_graph.json.error is defined and ('already exists' not in (alb_http_combined_graph.json.error.data | default('')))
+
+
+- name: Create WEB triggers on service host with USE tags (fixed thresholds)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.create"
+      params:
+        description: "{{ item.description }}"
+        expression: "{{ item.expression }}"
+        priority: "{{ item.priority | int }}"
+        tags: "{{ item.tags | to_json | from_json }}"
+      auth: "{{ auth_token }}"
+      id: 14
+  loop:
+    - description: "ALB WEB p95 > 1500 ms (5m)"
+      priority: 3
+      expression: "avg(/{{ alb_service_host_tech }}/use.http.time.p95[WEB_ROOT],5m)>1500"
+      tags:
+        - { tag: "scope", value: "USE" }
+        - { tag: "resource", value: "http" }
+        - { tag: "use_type", value: "Saturation" }
+
+    - description: "ALB WEB p95 > 3000 ms (5m)"
+      priority: 4
+      expression: "avg(/{{ alb_service_host_tech }}/use.http.time.p95[WEB_ROOT],5m)>3000"
+      tags:
+        - { tag: "scope", value: "USE" }
+        - { tag: "resource", value: "http" }
+        - { tag: "use_type", value: "Saturation" }
+
+    - description: "ALB WEB unavailable (no data 2m)"
+      priority: 4
+      expression: "nodata(/{{ alb_service_host_tech }}/web.test.time[WEB_ROOT,GET_/,resp],2m)=1"
+      tags:
+        - { tag: "scope", value: "availability" }
+        - { tag: "scope", value: "USE" }     # чтобы попал на глобальный USE-дашборд
+        - { tag: "resource", value: "http" }
+        - { tag: "component", value: "alb" }
+  register: web_trg
+  failed_when: >
+    web_trg is defined and web_trg.results is defined and
+    (
+      web_trg.results
+      | selectattr('json.error', 'defined')
+      | rejectattr('json.error.data', 'search', 'already exists')
+      | list | length
+    ) > 0
+
+
+- name: Get obsolete ALB Errors trigger (fail>0)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.get"
+      params:
+        hostids: ["{{ alb_hostid }}"]
+        output: ["triggerid","description"]
+        filter:
+          description: ["ALB WEB errors detected (fail>0, 2m window)"]
+      auth: "{{ auth_token }}"
+      id: 1490
+  register: alb_err_tr
+  changed_when: false
+  failed_when: false
+
+- name: Delete obsolete ALB Errors trigger (if exists)
+  when: alb_err_tr.json.result | length > 0
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.delete"
+      params:
+        - "{{ alb_err_tr.json.result[0].triggerid }}"
+      auth: "{{ auth_token }}"
+      id: 1491
+
+- name: Ensure Unavailable trigger has scope=USE tag (fetch)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.get"
+      params:
+        hostids: ["{{ alb_hostid }}"]
+        output: ["triggerid","description","tags"]
+        filter:
+          description: ["ALB WEB unavailable (no data 2m)"]
+      auth: "{{ auth_token }}"
+      id: 1492
+  register: alb_unavail_tr
+  changed_when: false
+  failed_when: false
+
+- name: Add scope=USE tag to Unavailable trigger (if missing)
+  when: >
+    alb_unavail_tr.json.result | length > 0 and
+    (
+      (alb_unavail_tr.json.result[0].tags | default([]) | selectattr('tag','equalto','scope') | selectattr('value','equalto','USE') | list | length) == 0
+    )
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.update"
+      params:
+        triggerid: "{{ alb_unavail_tr.json.result[0].triggerid }}"
+        tags:
+          - { tag: "scope", value: "availability" }
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "http" }
+          - { tag: "component", value: "alb" }
+      auth: "{{ auth_token }}"
+      id: 1493

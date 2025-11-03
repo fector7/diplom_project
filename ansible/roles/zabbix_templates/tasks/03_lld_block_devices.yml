@@ -1,0 +1,212 @@
+- name: Create LLD rule for block devices
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.create"
+      params:
+        name: "Block device discovery"
+        key_: "vfs.dev.discovery"
+        hostid: "{{ use_template_id }}"
+        type: 0
+        delay: "1m"
+      auth: "{{ auth_token }}"
+      id: 11
+  register: lld_dev_creation
+  failed_when: lld_dev_creation.json.error is defined and ('already exists' not in lld_dev_creation.json.error.data)
+
+- name: Get LLD rule ID for block devices
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.get"
+      params:
+        output: ["itemid"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          key_: "vfs.dev.discovery"
+      auth: "{{ auth_token }}"
+      id: 12
+  register: lld_dev_rule
+
+- name: Fail if block devices rule ID not found
+  fail:
+    msg: "No discovery rule id for vfs.dev.discovery in template {{ use_template_id }}."
+  when: lld_dev_rule.json.result | length == 0
+
+- name: Set block devices rule ID fact
+  set_fact:
+    lld_dev_rule_id: "{{ lld_dev_rule.json.result[0].itemid }}"
+
+- name: Create item prototype for disk utilization
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Disk Utilization % on {{'{'}}#DEVNAME{{'}'}}"
+        key_: "vfs.dev.util[{{'{'}}#DEVNAME{{'}'}}]"
+        type: 0
+        value_type: 0
+        units: "%"
+        delay: "1m"
+        ruleid: "{{ lld_dev_rule_id }}"
+        hostid: "{{ use_template_id }}"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Utilization" }
+        description: "Percent of time device was busy servicing requests (iostat %util)."
+      auth: "{{ auth_token }}"
+      id: 13_util
+  register: lld_dev_item_util
+  failed_when: lld_dev_item_util.json.error is defined and ('already exists' not in lld_dev_item_util.json.error.data)
+
+- name: Create item prototype for disk read await
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Disk Read await on {{'{'}}#DEVNAME{{'}'}}"
+        key_: "vfs.dev.read.await[{{'{'}}#DEVNAME{{'}'}}]"
+        type: 0
+        value_type: 0
+        delay: "1m"
+        units: "ms"
+        ruleid: "{{ lld_dev_rule_id }}"
+        hostid: "{{ use_template_id }}"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 13
+  register: lld_dev_item_read
+  failed_when: lld_dev_item_read.json.error is defined and ('already exists' not in lld_dev_item_read.json.error.data)
+
+- name: Create item prototype for disk write await
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Disk Write await on {{'{'}}#DEVNAME{{'}'}}"
+        key_: "vfs.dev.write.await[{{'{'}}#DEVNAME{{'}'}}]"
+        type: 0
+        value_type: 0
+        delay: "1m"
+        units: "ms"
+        ruleid: "{{ lld_dev_rule_id }}"
+        hostid: "{{ use_template_id }}"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 14
+  register: lld_dev_item_write
+  failed_when: lld_dev_item_write.json.error is defined and ('already exists' not in lld_dev_item_write.json.error.data)
+
+- name: Create trigger prototypes for block devices
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.create"
+      params:
+        - description: "High Disk Utilization on {{'{'}}#DEVNAME{{'}'}} (> {$DISK_UTIL_CLOUD}% cloud limit)"
+          expression: "avg(/USE_Monitoring_Template/vfs.dev.util[{{'{'}}#DEVNAME{{'}'}}],5m)>{$DISK_UTIL_CLOUD}"
+          priority: 3
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "disk" }
+            - { tag: "use_type", value: "Utilization" }
+            - { tag: "environment", value: "Yandex Cloud" }
+        - description: "High Disk Read Saturation on {{'{'}}#DEVNAME{{'}'}} (await > {$DISK_READ_AWAIT_CRIT}ms cloud)"
+          expression: "avg(/USE_Monitoring_Template/vfs.dev.read.await[{{'{'}}#DEVNAME{{'}'}}],5m)>{$DISK_READ_AWAIT_CRIT}"
+          priority: 4
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "disk" }
+            - { tag: "use_type", value: "Saturation" }
+            - { tag: "environment", value: "Yandex Cloud" }
+        - description: "High Disk Write Saturation on {{'{'}}#DEVNAME{{'}'}} (await > {$DISK_WRITE_AWAIT_CRIT}ms cloud)"
+          expression: "avg(/USE_Monitoring_Template/vfs.dev.write.await[{{'{'}}#DEVNAME{{'}'}}],5m)>{$DISK_WRITE_AWAIT_CRIT}"
+          priority: 4
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "disk" }
+            - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 15
+
+- name: Create graph prototype for disk I/O
+  when:
+    - lld_dev_item_util.json.result is defined
+    - lld_dev_item_read.json.result is defined
+    - lld_dev_item_write.json.result is defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graphprototype.create"
+      params:
+        name: "Disk I/O on {{'{'}}#DEVNAME{{'}'}} (USE)"
+        width: 900
+        height: 200
+        yaxismin: 0
+        yaxismax: 100
+        ymin_type: 0
+        ymax_type: 0
+        y2axismin: 0
+        y2axismax: 100
+        y2min_type: 0
+        y2max_type: 0
+        show_legend: 1
+        gitems:
+          - { color: "1A7C11", itemid: "{{ lld_dev_item_util.json.result.itemids[0] }}", yaxisside: 0, drawtype: 0, type: 0 }
+          - { color: "2774A4", itemid: "{{ lld_dev_item_read.json.result.itemids[0] }}", yaxisside: 1, drawtype: 0, type: 0 }
+          - { color: "F63100", itemid: "{{ lld_dev_item_write.json.result.itemids[0] }}", yaxisside: 1, drawtype: 0, type: 0 }
+      auth: "{{ auth_token }}"
+      id: 16
+  register: lld_dev_graph
+  failed_when: lld_dev_graph.json.error is defined and ('already exists' not in lld_dev_graph.json.error.data)
+
+- name: Update LLD filter for block devices
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.update"
+      params:
+        itemid: "{{ lld_dev_rule_id }}"
+        filter:
+          evaltype: 0
+          conditions:
+            - macro: "{{ '{' }}#DEVNAME{{ '}' }}"
+              operator: 9
+              value: "^(loop|zram|dm-).*$|.*\\d+$"
+              formulaid: "A"
+      auth: "{{ auth_token }}"
+      id: 17

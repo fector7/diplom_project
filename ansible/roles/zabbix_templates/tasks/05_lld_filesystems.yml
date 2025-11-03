@@ -1,0 +1,243 @@
+---
+- name: Create LLD rule for Filesystems
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.create"
+      params:
+        name: "Filesystem discovery"
+        key_: "vfs.fs.discovery"
+        hostid: "{{ use_template_id }}"
+        type: 0
+        delay: "1m"
+      auth: "{{ auth_token }}"
+      id: 26
+  register: lld_fs_creation
+  failed_when: lld_fs_creation.json.error is defined and ('already exists' not in lld_fs_creation.json.error.data)
+
+- name: Get LLD rule ID for filesystems
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.get"
+      params:
+        output: ["itemid"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          key_: "vfs.fs.discovery"
+      auth: "{{ auth_token }}"
+      id: 27
+  register: lld_fs_rule
+
+- name: Ensure filesystem discovery rule id exists
+  fail:
+    msg: "No discovery rule id for vfs.fs.discovery in template {{ use_template_id }}."
+  when: lld_fs_rule.json.result | length == 0
+
+- name: Set filesystem rule id
+  set_fact:
+    lld_fs_rule_id: "{{ lld_fs_rule.json.result[0].itemid }}"
+
+- name: Create item prototype for Disk Used Space
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "Disk space used on {{'{'}}#FSNAME{{'}'}} (%)"
+        key_: "vfs.fs.size[{{'{'}}#FSNAME{{'}'}},pused]"
+        type: 0
+        value_type: 0
+        units: "%"
+        delay: "5m"
+        ruleid: "{{ lld_fs_rule_id }}"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 28
+  register: fs_pused_item
+  failed_when: fs_pused_item.json.error is defined and ('already exists' not in fs_pused_item.json.error.data)
+
+- name: Get existing FS pused itemid
+  when: fs_pused_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_fs_rule_id }}"]
+        filter:
+          key_: "vfs.fs.size[{{'{'}}#FSNAME{{'}'}},pused]"
+      auth: "{{ auth_token }}"
+      id: 2801
+  register: fs_pused_get
+  changed_when: false
+
+- name: Set fs_pused_itemid fact
+  set_fact:
+    fs_pused_itemid: >-
+      {{
+        (fs_pused_item.json.result.itemids[0]
+          if (fs_pused_item.json.result is defined and (fs_pused_item.json.result.itemids | length) > 0)
+          else fs_pused_get.json.result[0].itemid
+        )
+      }}
+  when: fs_pused_item.json is defined or fs_pused_get.json is defined
+
+- name: Create Disk Space trigger (Warning)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.create"
+      params:
+        description: "High disk space usage on {{'{'}}#FSNAME{{'}'}} (> {$DISK_PUSED_HIGH}%)"
+        expression: "avg(/USE_Monitoring_Template/vfs.fs.size[{{'{'}}#FSNAME{{'}'}},pused],5m)>{$DISK_PUSED_HIGH}"
+        priority: 3
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 29
+  register: fs_warn_trigger
+  failed_when: fs_warn_trigger.json.error is defined and ('already exists' not in fs_warn_trigger.json.error.data)
+
+- name: Create Disk Space trigger (Critical)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.create"
+      params:
+        description: "Critical disk space usage on {{'{'}}#FSNAME{{'}'}} (> {$DISK_PUSED_CRIT}%)"
+        expression: "avg(/USE_Monitoring_Template/vfs.fs.size[{{'{'}}#FSNAME{{'}'}},pused],5m)>{$DISK_PUSED_CRIT}"
+        priority: 4
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "disk" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 30
+  register: fs_crit_trigger
+  failed_when: fs_crit_trigger.json.error is defined and ('already exists' not in fs_crit_trigger.json.error.data)
+
+- name: Get FS CRIT trigger ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.get"
+      params:
+        output: ["triggerid","description"]
+        hostids: ["{{ use_template_id }}"]
+        search:
+          description: "{$DISK_PUSED_CRIT}"
+        searchWildcardsEnabled: 1
+      auth: "{{ auth_token }}"
+      id: 33
+  register: fs_tp_crit
+
+- name: Get FS WARN trigger ID
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.get"
+      params:
+        output: ["triggerid","description"]
+        hostids: ["{{ use_template_id }}"]
+        search:
+          description: "{$DISK_PUSED_HIGH}"
+        searchWildcardsEnabled: 1
+      auth: "{{ auth_token }}"
+      id: 34
+  register: fs_tp_warn
+
+- name: Set dependency for FS WARN on CRIT
+  when:
+    - fs_tp_warn.json.result | length > 0
+    - fs_tp_crit.json.result | length > 0
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.update"
+      params:
+        triggerid: "{{ fs_tp_warn.json.result[0].triggerid }}"
+        dependencies:
+          - triggerid: "{{ fs_tp_crit.json.result[0].triggerid }}"
+      auth: "{{ auth_token }}"
+      id: 35
+  register: fs_dep_result
+  failed_when: false
+
+- name: Create graph for Disk Used Space
+  when: fs_pused_itemid is defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graphprototype.create"
+      params:
+        name: "Disk Used Space on {{'{'}}#FSNAME{{'}'}} (%)"
+        width: 900
+        height: 200
+        yaxismin: 0
+        yaxismax: 100
+        gitems:
+          - color: "C80000"
+            itemid: "{{ fs_pused_itemid }}"
+      auth: "{{ auth_token }}"
+      id: 31
+  register: fs_graph
+  failed_when: fs_graph.json.error is defined and ('already exists' not in fs_graph.json.error.data)
+
+- name: Update LLD filter for filesystems
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.update"
+      params:
+        itemid: "{{ lld_fs_rule_id }}"
+        filter:
+          evaltype: 0
+          conditions:
+            - macro: "{{'{'}}#FSTYPE{{'}'}}"
+              operator: 8
+              value: "^(ext4|xfs|btrfs|zfs)$"
+      auth: "{{ auth_token }}"
+      id: 32
+  register: fs_filter_update
+  failed_when: false

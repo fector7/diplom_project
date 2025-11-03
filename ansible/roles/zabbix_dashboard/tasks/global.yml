@@ -1,0 +1,607 @@
+- name: Set endpoints and waits
+  set_fact:
+    zbx_api_url: '{{ zbx_api_url | default(''http://localhost/zabbix/api_jsonrpc.php'') }}'
+    use_hosts_wait_retries: '{{ use_hosts_wait_retries | default(30) }}'
+    use_hosts_wait_delay: '{{ use_hosts_wait_delay | default(10) }}'
+    use_lld_wait_enabled: '{{ use_lld_wait_enabled | default(true) }}'
+    use_lld_wait_retries: '{{ use_lld_wait_retries | default(30) }}'
+    use_lld_wait_delay: '{{ use_lld_wait_delay | default(10) }}'
+
+
+- name: Token exists
+  when: auth_token is not defined
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: user.login
+      params:
+        user: '{{ zabbix_api_user }}'
+        password: '{{ zabbix_api_pass }}'
+      id: 1
+    status_code: 200
+  register: zbx_auth2
+
+
+- name: Set token from ensure
+  when: auth_token is not defined
+  set_fact:
+    auth_token: '{{ zbx_auth2.json.result | default('''') }}'
+
+
+- name: Fail if auth failed
+  when: auth_token | length == 0
+  fail:
+    msg: Zabbix API auth failed. Check zabbix_api_user/zabbix_api_pass or zbx_api_url.
+
+
+- name: Fetch hosts (wait until at least 1 has USE_Monitoring_Template)
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: host.get
+      params:
+        selectParentTemplates:
+        - name
+        output:
+        - hostid
+        - host
+        - name
+      auth: '{{ auth_token }}'
+      id: 2
+  register: hosts_all
+  until: "(\n  (hosts_all.json.result | default([]))\n  | json_query(\"[?parentTemplates &&\
+    \ parentTemplates[?name=='USE_Monitoring_Template']]\")\n  | length\n) > 0\n"
+  retries: '{{ use_hosts_wait_retries | int }}'
+  delay: '{{ use_hosts_wait_delay | int }}'
+
+
+- name: Filter hosts with USE_Monitoring_Template
+  set_fact:
+    hosts_use: "{{\n  hosts_all.json.result | default([])\n  | json_query(\"[?parentTemplates\
+      \ && parentTemplates[?name=='USE_Monitoring_Template']]\")\n}}"
+
+
+- name: Debug hosts with USE template
+  debug:
+    msg: 'Hosts with USE template ({{ hosts_use | length }}): {{ hosts_use | map(attribute=''name'')
+      | list }}'
+
+
+- name: Stop if there are no hosts
+  when: hosts_use | length == 0
+  debug:
+    msg: No hosts with USE_Monitoring_Template  nothing to build.
+  changed_when: false
+- name: Try to find ALB service host
+  when: hosts_use | length > 0
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: host.get
+      params:
+        filter:
+          host:
+          - '{{ alb_service_host_tech | default(''service-frontend-alb'') }}'
+        output:
+        - hostid
+        - host
+        - name
+      auth: '{{ auth_token }}'
+      id: 2001
+  register: alb_host_info
+  failed_when: false
+  changed_when: false
+
+
+- name: Build combined hostids
+  when: hosts_use | length > 0
+  set_fact:
+    hostids_all: "{{\n  (hosts_use | map(attribute='hostid') | list)\n  +\n  (\n    (((alb_host_info.json.result\
+      \ | default([])) | length) > 0)\n    | ternary([ (alb_host_info.json.result | first).hostid\
+      \ ], [])\n  )\n}}"
+
+
+- name: Get graphs for selected hosts
+  when: (hosts_use | length > 0)
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: graph.get
+      params:
+        hostids: '{{ hostids_all }}'
+        output:
+        - graphid
+        - name
+        selectHosts:
+        - hostid
+        - name
+        - host
+      auth: '{{ auth_token }}'
+      id: 3
+  register: all_graphs
+
+
+- name: Build graph buckets
+  set_fact:
+    g_cpu_util: '{{ all_graphs.json.result | selectattr(''name'',''search'',''CPU Utilization'')
+      | list }}'
+    g_cpu_load: '{{ all_graphs.json.result | selectattr(''name'',''search'',''CPU Load Average'')
+      | list }}'
+    g_ram_swap: '{{ all_graphs.json.result | selectattr(''name'',''search'',''Swap'') | list
+      }}'
+    g_ram_util: '{{ all_graphs.json.result | selectattr(''name'',''search'',''RAM Utilization'')
+      | list }}'
+    g_ram_oom: '{{ all_graphs.json.result | selectattr(''name'',''search'',''OOM'') | list
+      }}'
+    g_disk_await: '{{ all_graphs.json.result | selectattr(''name'',''search'',''^Disk I/O
+      on '') | list }}'
+    g_fs_pused: '{{ all_graphs.json.result | selectattr(''name'',''search'',''^Disk Used Space
+      on '') | list }}'
+    g_net_traf: '{{ all_graphs.json.result | selectattr(''name'',''search'',''^Network Traffic
+      on '') | list }}'
+    g_net_retrans: '{{ all_graphs.json.result | selectattr(''name'',''search'',''^TCP retransmissions,
+      pps$'') | list }}'
+    g_net_conn: '{{ all_graphs.json.result | selectattr(''name'',''search'',''^TCP established
+      connections$'') | list }}'
+    g_http_all: '{{ all_graphs.json.result | selectattr(''name'',''search'',''HTTP WEB_ROOT
+      Metrics'') | list }}'
+    g_http_p95: []
+
+
+- name: Pick HTTP graphs for web-* and ALB
+  set_fact:
+    g_http_p95: '{{ g_http_p95 + [ item ] }}'
+  loop: '{{ g_http_all | default([]) }}'
+  when: "item.hosts is defined and item.hosts | length > 0 and (\n  (item.hosts[0].name |\
+    \ default('')) is match('^web-[0-9]+\\\\..*')\n  or\n  (item.hosts[0].name | default(''))\
+    \ == (alb_service_host | default('Service: Frontend (ALB)'))\n)\n"
+
+
+- name: Debug graph counts
+  debug:
+    msg: 'CPU util: {{ g_cpu_util | length }}, CPU load: {{ g_cpu_load | length }}
+
+      RAM swap: {{ g_ram_swap | length }}, RAM util: {{ g_ram_util | length }}, RAM oom: {{
+      g_ram_oom | length }}
+
+      DISK I/O: {{ g_disk_await | length }}, DISK used: {{ g_fs_pused | length }}
+
+      NET traffic: {{ g_net_traf | length }}, NET retrans: {{ g_net_retrans | length }}, NET
+      established: {{ g_net_conn | length }}
+
+      HTTP combined: {{ g_http_p95 | length }}
+
+      '
+- name: Grid constants (base)
+  set_fact:
+    grid_rows_total: 63
+    widget_h: 6
+    header_h: 6
+
+
+- name: Grid constants (derived)
+  set_fact:
+    rows_after_header: '{{ (grid_rows_total | int - header_h | int) // (widget_h | int) }}'
+    max_y: '{{ (grid_rows_total | int) - (widget_h | int) }}'
+
+
+- name: Build CPU widgets raw
+  set_fact:
+    cpu_widgets_raw: []
+
+
+- name: CPU U
+  loop: '{{ g_cpu_util | default([]) }}'
+  set_fact:
+    cpu_widgets_raw: '{{ cpu_widgets_raw + [ { ''title'': ''[CPU][U] '' ~ item.name ~ '' on
+      '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: CPU S
+  loop: '{{ g_cpu_load | default([]) }}'
+  set_fact:
+    cpu_widgets_raw: '{{ cpu_widgets_raw + [ { ''title'': ''[CPU][S] '' ~ item.name ~ '' on
+      '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: Build RAM widgets raw
+  set_fact:
+    ram_widgets_raw: []
+
+
+- name: RAM S (swap)
+  loop: '{{ g_ram_swap | default([]) }}'
+  set_fact:
+    ram_widgets_raw: '{{ ram_widgets_raw + [ { ''title'': ''[RAM][S] '' ~ item.name ~ '' on
+      '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: RAM U
+  loop: '{{ g_ram_util | default([]) }}'
+  set_fact:
+    ram_widgets_raw: '{{ ram_widgets_raw + [ { ''title'': ''[RAM][U] '' ~ item.name ~ '' on
+      '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: RAM E (OOM)
+  loop: '{{ g_ram_oom | default([]) }}'
+  set_fact:
+    ram_widgets_raw: '{{ ram_widgets_raw + [ { ''title'': ''[RAM][E] '' ~ item.name ~ '' on
+      '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: Build DISK widgets raw
+  set_fact:
+    disk_widgets_raw: []
+- name: DISK S (I/O await)
+  loop: '{{ g_disk_await | default([]) }}'
+  set_fact:
+    disk_widgets_raw: '{{ disk_widgets_raw + [ { ''title'': ''[DISK][S] '' ~ item.name ~ ''
+      on '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: DISK U (fs used)
+  loop: '{{ g_fs_pused | default([]) }}'
+  set_fact:
+    disk_widgets_raw: '{{ disk_widgets_raw + [ { ''title'': ''[DISK][U] '' ~ item.name ~ ''
+      on '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: Build NET widgets raw
+  set_fact:
+    net_widgets_raw: []
+- name: NET U (traffic)
+  loop: '{{ g_net_traf | default([]) }}'
+  set_fact:
+    net_widgets_raw: "{{ net_widgets_raw + [ {\n    'title': '[NET][U] ' ~ item.name ~ ' on\
+      \ ' ~ ((item.hosts | default([])) | first | default({'name':'Unknown'})).name,\n   \
+      \ 'graphid': (item.graphid | int)\n  } ] }}"
+
+
+- name: NET S (TCP retransmissions)
+  loop: '{{ g_net_retrans | default([]) }}'
+  set_fact:
+    net_widgets_raw: "{{ net_widgets_raw + [ {\n    'title': '[NET][S] ' ~ item.name ~ ' on\
+      \ ' ~ ((item.hosts | default([])) | first | default({'name':'Unknown'})).name,\n   \
+      \ 'graphid': (item.graphid | int)\n  } ] }}"
+
+
+- name: NET U (TCP established connections)
+  loop: '{{ g_net_conn | default([]) }}'
+  set_fact:
+    net_widgets_raw: "{{ net_widgets_raw + [ {\n    'title': '[NET][U] ' ~ item.name ~ ' on\
+      \ ' ~ ((item.hosts | default([])) | first | default({'name':'Unknown'})).name,\n   \
+      \ 'graphid': (item.graphid | int)\n  } ] }}"
+
+
+- name: Build HTTP widgets raw
+  set_fact:
+    http_widgets_raw: []
+
+
+- name: HTTP S (p95)
+  loop: '{{ g_http_p95 | default([]) }}'
+  set_fact:
+    http_widgets_raw: '{{ http_widgets_raw + [ { ''title'': ''[HTTP][S] '' ~ item.name ~ ''
+      on '' ~ ((item.hosts|default([]))|first|default({''name'':''Unknown''})).name, ''graphid'':
+      (item.graphid | int) } ] }}'
+
+
+- name: Position CPU widgets
+  set_fact:
+    cpu_widgets_pos: []
+- set_fact:
+    cpu_widgets_pos: '{{ cpu_widgets_pos + [ { ''type'':''graph'', ''name'': item.title, ''x'':
+      (((idx | int) % 2) * 12), ''y'': (((((idx | int) // 2) % (rows_after_header | int))
+      * (widget_h | int)) + (header_h | int)), ''width'': 12, ''height'': (widget_h | int),
+      ''fields'': [ { ''type'': 6, ''name'': ''graphid'', ''value'': (item.graphid | int)
+      } ], ''page_index'': (((idx | int) // 2) // (rows_after_header | int)) } ] }}'
+  loop: '{{ cpu_widgets_raw }}'
+  loop_control:
+    index_var: idx
+
+    
+- name: Position RAM widgets
+  set_fact:
+    ram_widgets_pos: []
+- set_fact:
+    ram_widgets_pos: '{{ ram_widgets_pos + [ { ''type'':''graph'', ''name'': item.title, ''x'':
+      (((idx | int) % 2) * 12), ''y'': (((((idx | int) // 2) % (rows_after_header | int))
+      * (widget_h | int)) + (header_h | int)), ''width'': 12, ''height'': (widget_h | int),
+      ''fields'': [ { ''type'': 6, ''name'': ''graphid'', ''value'': (item.graphid | int)
+      } ], ''page_index'': (((idx | int) // 2) // (rows_after_header | int)) } ] }}'
+  loop: '{{ ram_widgets_raw }}'
+  loop_control:
+    index_var: idx
+
+
+- name: Position DISK widgets
+  set_fact:
+    disk_widgets_pos: []
+- set_fact:
+    disk_widgets_pos: '{{ disk_widgets_pos + [ { ''type'':''graph'', ''name'': item.title,
+      ''x'': (((idx | int) % 2) * 12), ''y'': (((((idx | int) // 2) % (rows_after_header |
+      int)) * (widget_h | int)) + (header_h | int)), ''width'': 12, ''height'': (widget_h
+      | int), ''fields'': [ { ''type'': 6, ''name'': ''graphid'', ''value'': (item.graphid
+      | int) } ], ''page_index'': (((idx | int) // 2) // (rows_after_header | int)) } ] }}'
+  loop: '{{ disk_widgets_raw }}'
+  loop_control:
+    index_var: idx
+
+
+- name: Position NET widgets
+  set_fact:
+    net_widgets_pos: []
+- set_fact:
+    net_widgets_pos: '{{ net_widgets_pos + [ { ''type'':''graph'', ''name'': item.title, ''x'':
+      (((idx | int) % 2) * 12), ''y'': (((((idx | int) // 2) % (rows_after_header | int))
+      * (widget_h | int)) + (header_h | int)), ''width'': 12, ''height'': (widget_h | int),
+      ''fields'': [ { ''type'': 6, ''name'': ''graphid'', ''value'': (item.graphid | int)
+      } ], ''page_index'': (((idx | int) // 2) // (rows_after_header | int)) } ] }}'
+  loop: '{{ net_widgets_raw }}'
+  loop_control:
+    index_var: idx
+
+
+- name: Position HTTP widgets
+  set_fact:
+    http_widgets_pos: []
+- set_fact:
+    http_widgets_pos: '{{ http_widgets_pos + [ { ''type'':''graph'', ''name'': item.title,
+      ''x'': (((idx | int) % 2) * 12), ''y'': (((((idx | int) // 2) % (rows_after_header |
+      int)) * (widget_h | int)) + (header_h | int)), ''width'': 12, ''height'': (widget_h
+      | int), ''fields'': [ { ''type'': 6, ''name'': ''graphid'', ''value'': (item.graphid
+      | int) } ], ''page_index'': (((idx | int) // 2) // (rows_after_header | int)) } ] }}'
+  loop: '{{ http_widgets_raw }}'
+  loop_control:
+    index_var: idx
+
+
+- name: Calc CPU pages count
+  set_fact:
+    cpu_pages_count: '{{ ((cpu_widgets_pos|length + 1)//2 + (rows_after_header|int) - 1)//(rows_after_header|int)
+      }}'
+
+
+- name: Calc RAM pages count
+  set_fact:
+    ram_pages_count: '{{ ((ram_widgets_pos|length + 1)//2 + (rows_after_header|int) - 1)//(rows_after_header|int)
+      }}'
+
+
+- name: Calc DISK pages count
+  set_fact:
+    disk_pages_count: '{{ ((disk_widgets_pos|length + 1)//2 + (rows_after_header|int) - 1)//(rows_after_header|int)
+      }}'
+
+
+- name: Calc NET pages count
+  set_fact:
+    net_pages_count: '{{ ((net_widgets_pos|length + 1)//2 + (rows_after_header|int) - 1)//(rows_after_header|int)
+
+
+      }}'
+- name: Calc HTTP pages count
+  set_fact:
+    http_pages_count: '{{ ((http_widgets_pos|length + 1)//2 + (rows_after_header|int) - 1)//(rows_after_header|int)
+      }}'
+
+
+- name: Build CPU pages array
+  set_fact:
+    pages_cpu: []
+
+
+
+- name: Fill CPU pages
+  set_fact:
+    pages_cpu: "{{ pages_cpu + [ {\n    'name': 'CPU' ~ ( ((idx | int) == 0) | ternary('',\
+      \ ' (' ~ ((idx | int) + 1) ~ ')') ),\n    'widgets':\n      (\n        ((idx|int)==0)\
+      \ | ternary(\n          [ {\n              'type':'problems','name':'CPU Problems [USE]',\n\
+      \              'x':0,'y':0,'width':24,'height': (header_h | int),\n              'fields':\
+      \ [\n                { 'type': 1, 'name': 'tags.tag.0',      'value': 'scope' },\n \
+      \               { 'type': 1, 'name': 'tags.value.0',    'value': 'USE' },\n        \
+      \        { 'type': 0, 'name': 'tags.operator.0', 'value': 0 },\n                { 'type':\
+      \ 1, 'name': 'tags.tag.1',      'value': 'resource' },\n                { 'type': 1,\
+      \ 'name': 'tags.value.1',    'value': 'cpu' },\n                { 'type': 0, 'name':\
+      \ 'tags.operator.1', 'value': 0 },\n                { 'type': 0, 'name': 'severity.0',\
+      \      'value': 2 },\n                { 'type': 0, 'name': 'severity.1',      'value':\
+      \ 3 },\n                { 'type': 0, 'name': 'severity.2',      'value': 4 },\n    \
+      \            { 'type': 0, 'name': 'severity.3',      'value': 5 },\n               \
+      \ { 'type': 0, 'name': 'show_timeline',   'value': 1 },\n                { 'type': 0,\
+      \ 'name': 'show_tags',       'value': 3 }\n              ]\n            } ],\n     \
+      \     []\n        )\n        + (cpu_widgets_pos | selectattr('page_index','equalto',\
+      \ idx | int) | list)\n      )\n  } ] }}"
+  loop: '{{ range(0, cpu_pages_count|int) | list }}'
+  loop_control:
+    index_var: idx
+
+
+- name: Build RAM pages array
+  set_fact:
+    pages_ram: []
+
+
+- name: Fill RAM pages
+  set_fact:
+    pages_ram: "{{ pages_ram + [ {\n    'name': 'RAM' ~ ( ((idx | int) == 0) | ternary('',\
+      \ ' (' ~ ((idx | int) + 1) ~ ')') ),\n    'widgets':\n      (\n        ((idx|int)==0)\
+      \ | ternary(\n          [ {\n              'type':'problems','name':'RAM Problems [USE]',\n\
+      \              'x':0,'y':0,'width':24,'height': (header_h | int),\n              'fields':\
+      \ [\n                { 'type': 1, 'name': 'tags.tag.0',      'value': 'scope' },\n \
+      \               { 'type': 1, 'name': 'tags.value.0',    'value': 'USE' },\n        \
+      \        { 'type': 0, 'name': 'tags.operator.0', 'value': 0 },\n                { 'type':\
+      \ 1, 'name': 'tags.tag.1',      'value': 'resource' },\n                { 'type': 1,\
+      \ 'name': 'tags.value.1',    'value': 'ram' },\n                { 'type': 0, 'name':\
+      \ 'tags.operator.1', 'value': 0 },\n                { 'type': 0, 'name': 'severity.0',\
+      \      'value': 2 },\n                { 'type': 0, 'name': 'severity.1',      'value':\
+      \ 3 },\n                { 'type': 0, 'name': 'severity.2',      'value': 4 },\n    \
+      \            { 'type': 0, 'name': 'severity.3',      'value': 5 },\n               \
+      \ { 'type': 0, 'name': 'show_timeline',   'value': 1 },\n                { 'type': 0,\
+      \ 'name': 'show_tags',       'value': 3 }\n              ]\n            } ],\n     \
+      \     []\n        )\n        + (ram_widgets_pos | selectattr('page_index','equalto',\
+      \ idx | int) | list)\n      )\n  } ] }}"
+  loop: '{{ range(0, ram_pages_count|int) | list }}'
+  loop_control:
+    index_var: idx
+- name: Build DISK pages array
+  set_fact:
+    pages_disk: []
+
+- name: Fill DISK pages
+  set_fact:
+    pages_disk: "{{ pages_disk + [ {\n    'name': 'DISK' ~ ( ((idx | int) == 0) | ternary('',\
+      \ ' (' ~ ((idx | int) + 1) ~ ')') ),\n    'widgets':\n      (\n        ((idx|int)==0)\
+      \ | ternary(\n          [ {\n              'type':'problems','name':'DISK Problems [USE]',\n\
+      \              'x':0,'y':0,'width':24,'height': (header_h | int),\n              'fields':\
+      \ [\n                { 'type': 1, 'name': 'tags.tag.0',      'value': 'scope' },\n \
+      \               { 'type': 1, 'name': 'tags.value.0',    'value': 'USE' },\n        \
+      \        { 'type': 0, 'name': 'tags.operator.0', 'value': 0 },\n                { 'type':\
+      \ 1, 'name': 'tags.tag.1',      'value': 'resource' },\n                { 'type': 1,\
+      \ 'name': 'tags.value.1',    'value': 'disk' },\n                { 'type': 0, 'name':\
+      \ 'tags.operator.1', 'value': 0 },\n                { 'type': 0, 'name': 'severity.0',\
+      \      'value': 2 },\n                { 'type': 0, 'name': 'severity.1',      'value':\
+      \ 3 },\n                { 'type': 0, 'name': 'severity.2',      'value': 4 },\n    \
+      \            { 'type': 0, 'name': 'severity.3',      'value': 5 },\n               \
+      \ { 'type': 0, 'name': 'show_timeline',   'value': 1 },\n                { 'type': 0,\
+      \ 'name': 'show_tags',       'value': 3 }\n              ]\n            } ],\n     \
+      \     []\n        )\n        + (disk_widgets_pos | selectattr('page_index','equalto',\
+      \ idx | int) | list)\n      )\n  } ] }}"
+  loop: '{{ range(0, disk_pages_count|int) | list }}'
+  loop_control:
+    index_var: idx
+- name: Build NET pages array
+  set_fact:
+    pages_net_new: []
+
+- name: Fill NET pages
+  set_fact:
+    pages_net_new: "{{ pages_net_new + [ {\n    'name': 'NET' ~ ( ((idx | int) == 0) | ternary('',\
+      \ ' (' ~ ((idx | int) + 1) ~ ')') ),\n    'widgets':\n      (\n        ((idx|int)==0)\
+      \ | ternary(\n          [ {\n              'type':'problems','name':'NET Problems [USE]',\n\
+      \              'x':0,'y':0,'width':24,'height': (header_h | int),\n              'fields':\
+      \ [\n                { 'type': 1, 'name': 'tags.tag.0',      'value': 'scope' },\n \
+      \               { 'type': 1, 'name': 'tags.value.0',    'value': 'USE' },\n        \
+      \        { 'type': 0, 'name': 'tags.operator.0', 'value': 0 },\n                { 'type':\
+      \ 1, 'name': 'tags.tag.1',      'value': 'resource' },\n                { 'type': 1,\
+      \ 'name': 'tags.value.1',    'value': 'net' },\n                { 'type': 0, 'name':\
+      \ 'tags.operator.1', 'value': 0 },\n                { 'type': 0, 'name': 'severity.0',\
+      \      'value': 2 },\n                { 'type': 0, 'name': 'severity.1',      'value':\
+      \ 3 },\n                { 'type': 0, 'name': 'severity.2',      'value': 4 },\n    \
+      \            { 'type': 0, 'name': 'severity.3',      'value': 5 },\n               \
+      \ { 'type': 0, 'name': 'show_timeline',   'value': 1 },\n                { 'type': 0,\
+      \ 'name': 'show_tags',       'value': 3 }\n              ]\n            } ],\n     \
+      \     []\n        )\n        + (net_widgets_pos | selectattr('page_index','equalto',\
+      \ idx | int) | list)\n      )\n  } ] }}"
+  loop: '{{ range(0, net_pages_count|int) | list }}'
+  loop_control:
+    index_var: idx
+- name: Build HTTP pages array
+  set_fact:
+    pages_http_new: []
+
+- name: Fill HTTP pages
+  set_fact:
+    pages_http_new: "{{ pages_http_new + [ {\n    'name': 'HTTP' ~ ( ((idx | int) == 0) |\
+      \ ternary('', ' (' ~ ((idx | int) + 1) ~ ')') ),\n    'widgets':\n      (\n        ((idx|int)==0)\
+      \ | ternary(\n          [ {\n              'type':'problems','name':'HTTP Problems [USE]',\n\
+      \              'x':0,'y':0,'width':24,'height': (header_h | int),\n              'fields':\
+      \ [\n                { 'type': 1, 'name': 'tags.tag.0',      'value': 'scope' },\n \
+      \               { 'type': 1, 'name': 'tags.value.0',    'value': 'USE' },\n        \
+      \        { 'type': 0, 'name': 'tags.operator.0', 'value': 0 },\n                { 'type':\
+      \ 1, 'name': 'tags.tag.1',      'value': 'resource' },\n                { 'type': 1,\
+      \ 'name': 'tags.value.1',    'value': 'http' },\n                { 'type': 0, 'name':\
+      \ 'tags.operator.1', 'value': 0 },\n                { 'type': 0, 'name': 'severity.0',\
+      \      'value': 2 },\n                { 'type': 0, 'name': 'severity.1',      'value':\
+      \ 3 },\n                { 'type': 0, 'name': 'severity.2',      'value': 4 },\n    \
+      \            { 'type': 0, 'name': 'severity.3',      'value': 5 },\n               \
+      \ { 'type': 0, 'name': 'show_timeline',   'value': 1 },\n                { 'type': 0,\
+      \ 'name': 'show_tags',       'value': 3 }\n              ]\n            } ],\n     \
+      \     []\n        )\n        + (http_widgets_pos | selectattr('page_index','equalto',\
+      \ idx | int) | list)\n      )\n  } ] }}"
+  loop: '{{ range(0, http_pages_count|int) | list }}'
+  loop_control:
+    index_var: idx
+- name: Assemble pages array (auto-paginated)
+  set_fact:
+    pages: "{{\n  []\n  + (pages_cpu | default([]))\n  + (pages_ram | default([]))\n  + (pages_disk\
+      \ | default([]))\n  + (pages_net_new | default([]))\n  + (pages_http_new | default([]))\n\
+      }}"
+- name: 'Clean pages: drop internal widget keys (page_index)'
+  set_fact:
+    pages_clean: []
+  when: pages is defined
+- name: Build pages_clean without page_index
+  set_fact:
+    pages_clean: "{{ pages_clean + [ {\n    'name': pg.name,\n    'widgets': (\n      pg.widgets\n\
+      \      | map('dict2items')\n      | map('rejectattr', 'key', 'equalto', 'page_index')\n\
+      \      | map('items2dict')\n      | list\n    )\n  } ] }}"
+  loop: '{{ pages | default([]) }}'
+  loop_control:
+    loop_var: pg
+  when: pages is defined
+
+- name: Get existing global dashboard id
+  when: (pages_clean | length > 0)
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: dashboard.get
+      params:
+        filter:
+          name: USE Global Overview
+      auth: '{{ auth_token }}'
+      id: 4
+  register: dash_check
+
+- name: Create or update USE Global Overview (no flicker)
+  when: (pages_clean | length > 0)
+  uri:
+    url: '{{ zbx_api_url }}'
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: '2.0'
+      method: '{{ (dash_check.json.result | length > 0) | ternary(''dashboard.update'', ''dashboard.create'')
+        }}'
+      params: "{{\n  (dash_check.json.result | length > 0)\n  | ternary(\n      { 'dashboardid':\
+        \ (dash_check.json.result | first).dashboardid,\n        'name':'USE Global Overview',\
+        \ 'private':0, 'pages': pages_clean },\n      { 'name':'USE Global Overview', 'private':0,\
+        \ 'pages': pages_clean }\n  )\n}}"
+      auth: '{{ auth_token }}'
+      id: 6
+  register: dash_global
+  failed_when: dash_global.json.error is defined and ('already exists' not in (dash_global.json.error.data
+    | default('')))
+
+- name: Final summary
+  debug:
+    msg: 'Built pages: {{ pages_clean | map(attribute=''name'') | list }} | CPU pages: {{
+      pages_clean | selectattr(''name'',''search'',''^CPU'') | list | length }} | RAM pages:
+      {{ pages_clean | selectattr(''name'',''search'',''^RAM'') | list | length }} | DISK
+      pages: {{ pages_clean | selectattr(''name'',''search'',''^DISK'') | list | length }}
+      | NET pages: {{ pages_clean | selectattr(''name'',''search'',''^NET'') | list | length
+      }} | HTTP pages: {{ pages_clean | selectattr(''name'',''search'',''^HTTP'') | list |
+      length }}'

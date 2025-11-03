@@ -1,0 +1,21 @@
+---
+all:
+  children:
+    web:
+      hosts:
+        web-1.ru-central1.internal:
+        web-2.ru-central1.internal:
+    monitoring:
+      hosts:
+        zabbix-server.ru-central1.internal:
+        zabbix-web.ru-central1.internal:
+    logging:
+      hosts:
+        elasticsearch.ru-central1.internal:
+        kibana.ru-central1.internal:
+    bastion:
+      hosts:
+        bastion.ru-central1.internal:
+  vars:
+    pg_fqdn: "rc1a-62lp1kitblqkvtor.mdb.yandexcloud.net"
+    alb_ip: "158.160.202.185"

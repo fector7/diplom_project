@@ -1,0 +1,42 @@
+---
+- name: Ensure ES data dir
+  file:
+    path: /var/lib/elasticsearch
+    state: directory
+    owner: 1000
+    group: 1000
+    mode: '0755'
+  become: yes
+
+- name: Run Elasticsearch container with autodiscover labels
+  community.docker.docker_container:
+    name: elasticsearch
+    image: elasticsearch:7.17.9
+    state: started
+    restart_policy: always
+    published_ports:
+      - "9200:9200"
+    env:
+      discovery.type: "single-node"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      network.host: "0.0.0.0"
+      http.port: "9200"
+      logger.level: "INFO"
+      # path.logs не нужен для stdout
+    volumes:
+      - "/var/lib/elasticsearch:/usr/share/elasticsearch/data"
+    labels:
+      co.elastic.logs/enabled: "true"          
+      co.elastic.logs/module: "elasticsearch"
+      co.elastic.logs/fileset.stdout: "server"
+      co.elastic.logs/fileset.stderr: "server"
+  become: yes
+  notify: Restart filebeat
+
+- name: Wait for Elasticsearch to become available
+  wait_for:
+    port: 9200
+    host: "127.0.0.1"
+    delay: 10
+    timeout: 300
+  become: yes

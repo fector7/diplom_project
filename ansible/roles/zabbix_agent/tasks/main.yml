@@ -1,0 +1,142 @@
+---
+- name: Install Zabbix repo
+  apt:
+    deb: "https://repo.zabbix.com/zabbix/6.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.0-4+ubuntu22.04_all.deb"
+  become: yes
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Zabbix agent and sysstat (for iostat)
+  apt:
+    name:
+      - zabbix-agent
+      - sysstat
+    state: present
+  become: yes
+  tags: zabbix_agent
+
+- name: Allow zabbix user to run monitoring commands (restricted)
+  copy:
+    dest: /etc/sudoers.d/zabbix-use-monitoring
+    content: |
+      Defaults:zabbix !requiretty
+      zabbix ALL=(root) NOPASSWD: /usr/bin/journalctl -k -b -o cat
+      zabbix ALL=(root) NOPASSWD: /usr/bin/iostat
+    mode: '0440'
+    validate: 'visudo -cf %s'
+  become: yes
+  tags:
+    - zabbix_agent
+
+- name: Configure agent on Zabbix Server host
+  block:
+    - name: Set Server=127.0.0.1
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^Server='
+        line: 'Server=127.0.0.1'
+      notify: restart zabbix agent
+
+    - name: Set ServerActive=127.0.0.1
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^ServerActive='
+        line: 'ServerActive=127.0.0.1'
+      notify: restart zabbix agent
+
+    - name: Set Hostname="Zabbix server"
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^Hostname='
+        line: 'Hostname=Zabbix server'
+      notify: restart zabbix agent
+
+    - name: Remove HostMetadata to prevent auto-registration
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^HostMetadata='
+        state: absent
+      notify: restart zabbix agent
+  when: inventory_hostname == 'zabbix-server.ru-central1.internal'
+  become: yes
+
+- name: Configure agent on all other hosts for auto-registration
+  block:
+    - name: Set Server=zabbix-server.ru-central1.internal
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^Server='
+        line: 'Server=zabbix-server.ru-central1.internal'
+      notify: restart zabbix agent
+
+    - name: Set ServerActive=zabbix-server.ru-central1.internal
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^ServerActive='
+        line: 'ServerActive=zabbix-server.ru-central1.internal'
+      notify: restart zabbix agent
+
+    - name: Set Hostname={{ inventory_hostname }}
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^Hostname='
+        line: "Hostname={{ inventory_hostname }}"
+      notify: restart zabbix agent
+
+    - name: Set HostMetadata=linux
+      lineinfile:
+        path: /etc/zabbix/zabbix_agentd.conf
+        regexp: '^#? *HostMetadata='
+        line: 'HostMetadata=linux'
+      notify: restart zabbix agent
+  when: inventory_hostname != 'zabbix-server.ru-central1.internal'
+  become: yes
+
+- name: Set UnsafeUserParameters=0 (secure)
+  lineinfile:
+    path: /etc/zabbix/zabbix_agentd.conf
+    regexp: '^#?\\s*UnsafeUserParameters='
+    line: 'UnsafeUserParameters=0'
+  become: yes
+  notify: restart zabbix agent
+
+- name: Add DenyKey=system.run[*] (security)
+  lineinfile:
+    path: /etc/zabbix/zabbix_agentd.conf
+    regexp: '^DenyKey=system\\.run\\[\\*\\]'
+    line: 'DenyKey=system.run[*]'
+  become: yes
+  notify: restart zabbix agent
+
+- name: Remove old userparameters file to ensure clean state
+  file:
+    path: /etc/zabbix/zabbix_agentd.d/use-method.conf
+    state: absent
+  become: yes
+
+- name: Deploy USE Method userparameters (TESTED & WORKING)
+  copy:
+    dest: /etc/zabbix/zabbix_agentd.d/use-method.conf
+    mode: '0644'
+    content: |
+      UserParameter=vfs.dev.util[*],dev="$1"; LC_ALL=C sudo /usr/bin/iostat -dx 1 2 "$dev" 2>/dev/null | awk -v dev="$dev" '/^'"$dev"'/{print $(NF); exit}'
+      UserParameter=vfs.dev.read.await[*],dev="$1"; LC_ALL=C sudo /usr/bin/iostat -dx 1 2 "$dev" 2>/dev/null | awk 'BEGIN{c=0} /^Device/{for(i=1;i<=NF;i++) if($i=="r_await") c=i} /^'"$1"'/{if(c) print $c; exit}'
+      UserParameter=vfs.dev.write.await[*],dev="$1"; LC_ALL=C sudo /usr/bin/iostat -dx 1 2 "$dev" 2>/dev/null | awk 'BEGIN{c=0} /^Device/{for(i=1;i<=NF;i++) if($i=="w_await") c=i} /^'"$1"'/{if(c) print $c; else print "0"; exit}'
+      UserParameter=use.ram.oom,sudo /usr/bin/journalctl -k -b -o cat 2>/dev/null | /bin/grep -c "oom_killer\|Out of memory\|Killed process" 2>/dev/null
+      UserParameter=use.net.tcp.retrans,awk '/^Tcp:/ {if(++c==1){split($0,h)} else {split($0,v); for(i=1;i<=NF;i++) if(h[i]=="RetransSegs") {print v[i]; exit}}}' /proc/net/snmp
+      UserParameter=use.net.tcp.estab,ss -tn 2>/dev/null | grep -c ESTAB
+  become: yes
+  notify: restart zabbix agent
+
+- name: Ensure Zabbix agent is started and enabled
+  systemd:
+    name: zabbix-agent
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Flush handlers to apply changes
+  meta: flush_handlers

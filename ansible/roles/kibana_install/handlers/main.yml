@@ -1,0 +1,7 @@
+- name: Restart filebeat
+  community.docker.docker_container:
+    name: filebeat
+    state: started
+    restart: true
+  become: yes
+  failed_when: false

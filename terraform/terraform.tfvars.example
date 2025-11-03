@@ -1,0 +1,8 @@
+cloud_id                 = "b1gvp4hi11rte6hlv8prc"
+folder_id                = "b1g2s09li31uocu4pfl1s"
+service_account_id       = "ajejm1vslk1dr46q3po1a"
+service_account_key_file = "~/authorized_key.json"
+ssh_public_key           = "ssh-ed25519 AAAAC3NzaC1l1ZDI1NTE5AAAAIE+3JUVgdmLQ0i81WftYeJSjh31EsYU1n1+mMqCp32qKwz fedor@fedor-Virtual-Machine"
+my_ip                    = "5.141.30.237/32"
+db_password              = "SecurePassword123!"
+vm_user                  = "user"

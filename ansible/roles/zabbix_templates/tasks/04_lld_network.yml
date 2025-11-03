@@ -1,0 +1,537 @@
+---
+- name: Ensure template name var
+  set_fact:
+    zbx_template_name: "{{ zbx_template_name | default('USE_Monitoring_Template') }}"
+  changed_when: false
+
+- name: Create LLD rule for Network Interfaces
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.create"
+      params:
+        name: "Network interface discovery"
+        key_: "net.if.discovery"
+        hostid: "{{ use_template_id }}"
+        type: 0
+        delay: "60s"
+      auth: "{{ auth_token }}"
+      id: 18
+  register: lld_net_creation
+  failed_when: lld_net_creation.json.error is defined and ('already exists' not in lld_net_creation.json.error.data)
+
+- name: Get created LLD rule ID for network interfaces
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.get"
+      params:
+        output: ["itemid","name","key_","hostid"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          key_: "net.if.discovery"
+      auth: "{{ auth_token }}"
+      id: 19
+  register: lld_net_rule
+  changed_when: false
+
+- name: Ensure net.if.discovery rule id exists
+  fail:
+    msg: "No discovery rule id for net.if.discovery in template {{ use_template_id }}."
+  when: lld_net_rule.json.result | length == 0
+
+- name: Set network rule id
+  set_fact:
+    lld_net_rule_id: "{{ lld_net_rule.json.result[0].itemid }}"
+  changed_when: false
+
+# ---- item prototypes (errors/bytes/dropped) ----
+- name: Create item prototype Incoming errors
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Incoming errors on {{'{'}}#IFNAME{{'}'}}"
+        key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},errors]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 3
+        units: "pps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 20
+  register: net_in_err_item
+  failed_when: net_in_err_item.json.error is defined and ('already exists' not in net_in_err_item.json.error.data)
+
+- name: Ensure itemid for IN errors fetch if existed
+  when: net_in_err_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},errors]"
+      auth: "{{ auth_token }}"
+      id: 2001
+  register: net_in_err_get
+  changed_when: false
+
+- name: Set itemid for IN errors
+  set_fact:
+    itemid_in_err: >-
+      {{
+        (net_in_err_item.json.result.itemids[0]
+          if (net_in_err_item.json.result is defined and (net_in_err_item.json.result.itemids | length) > 0)
+          else net_in_err_get.json.result[0].itemid
+        )
+      }}
+
+- name: Create item prototype Outgoing errors
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Outgoing errors on {{'{'}}#IFNAME{{'}'}}"
+        key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},errors]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 3
+        units: "pps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 21
+  register: net_out_err_item
+  failed_when: net_out_err_item.json.error is defined and ('already exists' not in net_out_err_item.json.error.data)
+
+- name: Ensure itemid for OUT errors fetch if existed
+  when: net_out_err_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},errors]"
+      auth: "{{ auth_token }}"
+      id: 2101
+  register: net_out_err_get
+  changed_when: false
+
+- name: Set itemid for OUT errors
+  set_fact:
+    itemid_out_err: >-
+      {{
+        (net_out_err_item.json.result.itemids[0]
+          if (net_out_err_item.json.result is defined and (net_out_err_item.json.result.itemids | length) > 0)
+          else net_out_err_get.json.result[0].itemid
+        )
+      }}
+
+- name: Create item prototype Incoming traffic
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Incoming traffic on {{'{'}}#IFNAME{{'}'}}"
+        key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},bytes]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 0
+        units: "Bps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 22
+  register: net_in_bytes_item
+  failed_when: net_in_bytes_item.json.error is defined and ('already exists' not in net_in_bytes_item.json.error.data)
+
+- name: Ensure itemid for IN bytes fetch if existed
+  when: net_in_bytes_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},bytes]"
+      auth: "{{ auth_token }}"
+      id: 2201
+  register: net_in_bytes_get
+  changed_when: false
+
+- name: Set itemid for IN bytes
+  set_fact:
+    itemid_in_bytes: >-
+      {{
+        (net_in_bytes_item.json.result.itemids[0]
+          if (net_in_bytes_item.json.result is defined and (net_in_bytes_item.json.result.itemids | length) > 0)
+          else net_in_bytes_get.json.result[0].itemid
+        )
+      }}
+
+- name: Create item prototype Outgoing traffic
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Outgoing traffic on {{'{'}}#IFNAME{{'}'}}"
+        key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},bytes]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 0
+        units: "Bps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 23
+  register: net_out_bytes_item
+  failed_when: net_out_bytes_item.json.error is defined and ('already exists' not in net_out_bytes_item.json.error.data)
+
+- name: Ensure itemid for OUT bytes fetch if existed
+  when: net_out_bytes_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},bytes]"
+      auth: "{{ auth_token }}"
+      id: 2301
+  register: net_out_bytes_get
+  changed_when: false
+
+- name: Set itemid for OUT bytes
+  set_fact:
+    itemid_out_bytes: >-
+      {{
+        (net_out_bytes_item.json.result.itemids[0]
+          if (net_out_bytes_item.json.result is defined and (net_out_bytes_item.json.result.itemids | length) > 0)
+          else net_out_bytes_get.json.result[0].itemid
+        )
+      }}
+
+# Dropped packets (Saturation)
+- name: Create item prototype Incoming dropped
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Incoming dropped on {{'{'}}#IFNAME{{'}'}} (Saturation)"
+        key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},dropped]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 3
+        units: "pps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 28
+  register: net_in_dropped_item
+  failed_when: net_in_dropped_item.json.error is defined and ('already exists' not in net_in_dropped_item.json.error.data)
+
+- name: Ensure itemid for IN dropped fetch if existed
+  when: net_in_dropped_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.in[{{'{'}}#IFNAME{{'}'}},dropped]"
+      auth: "{{ auth_token }}"
+      id: 2801
+  register: net_in_dropped_get
+  changed_when: false
+
+- name: Set itemid for IN dropped
+  set_fact:
+    itemid_in_dropped: >-
+      {{
+        (net_in_dropped_item.json.result.itemids[0]
+          if (net_in_dropped_item.json.result is defined and (net_in_dropped_item.json.result.itemids | length) > 0)
+          else net_in_dropped_get.json.result[0].itemid
+        )
+      }}
+
+- name: Create item prototype Outgoing dropped
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.create"
+      params:
+        name: "Outgoing dropped on {{'{'}}#IFNAME{{'}'}} (Saturation)"
+        key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},dropped]"
+        hostid: "{{ use_template_id }}"
+        ruleid: "{{ lld_net_rule_id }}"
+        type: 0
+        value_type: 3
+        units: "pps"
+        delay: "60s"
+        delta: 1
+      auth: "{{ auth_token }}"
+      id: 29
+  register: net_out_dropped_item
+  failed_when: net_out_dropped_item.json.error is defined and ('already exists' not in net_out_dropped_item.json.error.data)
+
+- name: Ensure itemid for OUT dropped fetch if existed
+  when: net_out_dropped_item.json.result is not defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.get"
+      params:
+        output: ["itemid","key_"]
+        ruleids: ["{{ lld_net_rule_id }}"]
+        filter:
+          key_: "net.if.out[{{'{'}}#IFNAME{{'}'}},dropped]"
+      auth: "{{ auth_token }}"
+      id: 2901
+  register: net_out_dropped_get
+  changed_when: false
+
+- name: Set itemid for OUT dropped
+  set_fact:
+    itemid_out_dropped: >-
+      {{
+        (net_out_dropped_item.json.result.itemids[0]
+          if (net_out_dropped_item.json.result is defined and (net_out_dropped_item.json.result.itemids | length) > 0)
+          else net_out_dropped_get.json.result[0].itemid
+        )
+      }}
+
+# Add tags to item prototypes
+- name: Add tags to Network item prototypes
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "itemprototype.update"
+      params:
+        - itemid: "{{ itemid_in_err }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Errors" }
+        - itemid: "{{ itemid_out_err }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Errors" }
+        - itemid: "{{ itemid_in_bytes }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Utilization" }
+        - itemid: "{{ itemid_out_bytes }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Utilization" }
+        - itemid: "{{ itemid_in_dropped }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Saturation" }
+        - itemid: "{{ itemid_out_dropped }}"
+          tags:
+            - { tag: "scope", value: "USE" }
+            - { tag: "resource", value: "net" }
+            - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 32
+  register: itemprototype_tags_update
+  failed_when: false
+  changed_when: false
+
+# >>> less noisy trigger-prototype + saturation via macro
+- name: Create trigger prototype any network errors window 5m
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "triggerprototype.create"
+      params:
+        - description: "Network errors on {{'{'}}#IFNAME{{'}'}}"
+          expression: >-
+            (max(/{{ zbx_template_name }}/net.if.in[{{'{'}}#IFNAME{{'}'}},errors],5m)>0 or
+             max(/{{ zbx_template_name }}/net.if.out[{{'{'}}#IFNAME{{'}'}},errors],5m)>0)
+          priority: 3
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "net" }, { tag: "use_type", value: "Errors" } ]
+        - description: "Network dropped packets on {{'{'}}#IFNAME{{'}'}} (Saturation)"
+          expression: >-
+            (max(/{{ zbx_template_name }}/net.if.in[{{'{'}}#IFNAME{{'}'}},dropped],5m)>{$NET_DROPPED_THRESH} or
+             max(/{{ zbx_template_name }}/net.if.out[{{'{'}}#IFNAME{{'}'}},dropped],5m)>{$NET_DROPPED_THRESH})
+          priority: 3
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "net" }, { tag: "use_type", value: "Saturation" } ]
+      auth: "{{ auth_token }}"
+      id: 24
+  register: lld_net_triggers
+  failed_when: lld_net_triggers.json.error is defined and ('already exists' not in lld_net_triggers.json.error.data)
+
+- name: Create graph prototype Network Errors
+  when:
+    - itemid_in_err is defined
+    - itemid_out_err is defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graphprototype.create"
+      params:
+        name: "Network Errors on {{'{'}}#IFNAME{{'}'}}"
+        width: 900
+        height: 200
+        gitems:
+          - color: "F63100"
+            itemid: "{{ itemid_in_err }}"
+          - color: "C80000"
+            itemid: "{{ itemid_out_err }}"
+      auth: "{{ auth_token }}"
+      id: 25
+  register: lld_net_graph_err
+  failed_when: lld_net_graph_err.json.error is defined and ('already exists' not in lld_net_graph_err.json.error.data)
+
+- name: Create graph prototype Network Traffic
+  when:
+    - itemid_in_bytes is defined
+    - itemid_out_bytes is defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graphprototype.create"
+      params:
+        name: "Network Traffic on {{'{'}}#IFNAME{{'}'}}"
+        width: 900
+        height: 200
+        gitems:
+          - color: "1A7C11"
+            itemid: "{{ itemid_in_bytes }}"
+          - color: "2774A4"
+            itemid: "{{ itemid_out_bytes }}"
+      auth: "{{ auth_token }}"
+      id: 26
+  register: lld_net_graph_traffic
+  failed_when: lld_net_graph_traffic.json.error is defined and ('already exists' not in lld_net_graph_traffic.json.error.data)
+
+- name: Create graph prototype Network Dropped
+  when:
+    - itemid_in_dropped is defined
+    - itemid_out_dropped is defined
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graphprototype.create"
+      params:
+        name: "Network Dropped on {{'{'}}#IFNAME{{'}'}} (Saturation)"
+        width: 900
+        height: 200
+        gitems:
+          - color: "F63100"
+            itemid: "{{ itemid_in_dropped }}"
+          - color: "C80000"
+            itemid: "{{ itemid_out_dropped }}"
+      auth: "{{ auth_token }}"
+      id: 31
+  register: lld_net_graph_dropped
+  failed_when: lld_net_graph_dropped.json.error is defined and ('already exists' not in lld_net_graph_dropped.json.error.data)
+
+- name: Update LLD filter for Network interface discovery
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "discoveryrule.update"
+      params:
+        itemid: "{{ lld_net_rule_id }}"
+        filter:
+          evaltype: 0
+          conditions:
+            - macro: "{{ '{' }}#IFNAME{{ '}' }}"
+              operator: 9
+              value: "^(lo|docker.*|veth.*|br-.*)$"
+              formulaid: "A"
+      auth: "{{ auth_token }}"
+      id: 27
+  register: lld_filter_update
+  failed_when: false
+  changed_when: false

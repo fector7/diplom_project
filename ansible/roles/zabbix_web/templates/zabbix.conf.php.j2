@@ -1,0 +1,12 @@
+<?php
+// Ansible-managed
+$DB['TYPE']     = 'POSTGRESQL';
+$DB['SERVER']   = '{{ pg_fqdn }}';
+$DB['PORT']     = '6432';
+$DB['DATABASE'] = 'zabbix';
+$DB['USER']     = 'zabbix';
+$DB['PASSWORD'] = '{{ db_password }}';
+
+$ZBX_SERVER      = 'zabbix-server.ru-central1.internal';
+$ZBX_SERVER_PORT = '10051';
+$ZBX_SERVER_NAME = 'Netology Diplom Zabbix';

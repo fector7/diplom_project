@@ -1,0 +1,27 @@
+#cloud-config
+hostname: ${hostname}
+fqdn: ${hostname}.ru-central1.internal
+manage_etc_hosts: true
+users:
+  - name: ${username}
+    groups: sudo
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh_authorized_keys:
+      - "${ssh_key}"
+package_update: true
+packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - net-tools
+  - stress-ng
+
+runcmd:
+  - dd if=/dev/zero of=/swapfile bs=1M count=1024
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - sysctl -w vm.swappiness=10

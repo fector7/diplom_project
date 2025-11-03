@@ -1,0 +1,398 @@
+﻿---
+- name: Create base items (Agent ping, CPU idle, RAM available, CPU load)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - { jsonrpc: "2.0", method: "item.create",
+        params: { name: "Agent ping", key_: "agent.ping", hostid: "{{ use_template_id }}",
+                  type: 0, value_type: 3, delay: "1m" },
+        auth: "{{ auth_token }}", id: 2001 }
+
+    - { jsonrpc: "2.0", method: "item.create",
+        params: {
+          name: "CPU Idle %",
+          key_: "system.cpu.util[,idle]",
+          hostid: "{{ use_template_id }}",
+          type: 0, value_type: 0, delay: "1m", units: "%",
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "cpu" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2002 }
+
+    - { jsonrpc: "2.0", method: "item.create",
+        params: {
+          name: "Memory Available %",
+          key_: "vm.memory.size[pavailable]",
+          hostid: "{{ use_template_id }}",
+          type: 0, value_type: 0, delay: "1m", units: "%",
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "ram" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2003 }
+
+    - { jsonrpc: "2.0", method: "item.create",
+        params: {
+          name: "CPU Load (1m avg per core)",
+          key_: "system.cpu.load[percpu,avg1]",
+          hostid: "{{ use_template_id }}",
+          type: 0, value_type: 0, delay: "1m",
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "cpu" }, { tag: "use_type", value: "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 2004 }
+
+    - { jsonrpc: "2.0", method: "item.create",
+        params: {
+          name: "Swap free, %",
+          key_: "system.swap.size[,pfree]",
+          hostid: "{{ use_template_id }}",
+          type: 0, value_type: 0, delay: "1m", units: "%",
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "ram" }, { tag: "use_type", value: "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 2005 }
+  register: base_items
+  failed_when: base_items.json.error is defined and ('already exists' not in base_items.json.error.data)
+  loop_control:
+    loop_var: item
+
+- name: Create calculated item CPU Utilization %
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "CPU Utilization %"
+        key_: "use.cpu.util"
+        type: 15
+        value_type: 0
+        units: "%"
+        delay: "1m"
+        params: "100 - last(//system.cpu.util[,idle])"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "cpu" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 2011
+  register: cpu_util
+  failed_when: cpu_util.json.error is defined and ('already exists' not in cpu_util.json.error.data)
+
+- name: Create calculated item Memory utilization %
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "RAM Utilization %"
+        key_: "use.mem.util"
+        type: 15
+        value_type: 0
+        units: "%"
+        delay: "1m"
+        params: "100 - last(//vm.memory.size[pavailable])"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "ram" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 2012
+  register: mem_util
+  failed_when: mem_util.json.error is defined and ('already exists' not in mem_util.json.error.data)
+
+- name: Create CPU triggers (USE)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "CPU utilization > {$CPU_UTIL_HIGH}% (5m)",
+          expression: "max(/USE_Monitoring_Template/use.cpu.util,5m)>{$CPU_UTIL_HIGH}",
+          priority: 3,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "cpu" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2021 }
+
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "CPU utilization > {$CPU_UTIL_CRIT}% (5m)",
+          expression: "max(/USE_Monitoring_Template/use.cpu.util,5m)>{$CPU_UTIL_CRIT}",
+          priority: 4,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "cpu" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2022 }
+
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "High CPU Load (>{$CPU_LOAD_SAT} per core, 5m)",
+          expression: "avg(/USE_Monitoring_Template/system.cpu.load[percpu,avg1],5m)>{$CPU_LOAD_SAT}",
+          priority: 3,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "cpu" }, { tag: "use_type", value: "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 2023 }
+  register: cpu_triggers
+  failed_when: false
+  loop_control:
+    loop_var: item
+
+- name: Create RAM triggers (USE)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "RAM utilization > {$RAM_UTIL_HIGH}% (5m)",
+          expression: "max(/USE_Monitoring_Template/use.mem.util,5m)>{$RAM_UTIL_HIGH}",
+          priority: 3,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "ram" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2031 }
+
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "RAM utilization > {$RAM_UTIL_CRIT}% (5m)",
+          expression: "max(/USE_Monitoring_Template/use.mem.util,5m)>{$RAM_UTIL_CRIT}",
+          priority: 4,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "ram" }, { tag: "use_type", value: "Utilization" } ]
+        },
+        auth: "{{ auth_token }}", id: 2032 }
+
+    - { jsonrpc: "2.0", method: "trigger.create",
+        params: {
+          description: "Swap free < {$SWAP_FREE_LOW}% (5m) (Saturation)",
+          expression: "min(/USE_Monitoring_Template/system.swap.size[,pfree],5m)<{$SWAP_FREE_LOW}",
+          priority: 3,
+          tags: [ { tag: "scope", value: "USE" }, { tag: "resource", value: "ram" }, { tag: "use_type", value: "Saturation" } ]
+        },
+        auth: "{{ auth_token }}", id: 2033 }
+  register: ram_triggers
+  failed_when: false
+  loop_control:
+    loop_var: item
+
+- name: Get RAM CRIT/WARN trigger ids
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.get"
+      params:
+        output: ["triggerid","description"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          description:
+            - "RAM utilization > {$RAM_UTIL_CRIT}% (5m)"
+            - "RAM utilization > {$RAM_UTIL_HIGH}% (5m)"
+      auth: "{{ auth_token }}"
+      id: 2041
+  register: ram_tw
+
+- name: Set dependency RAM WARN depends on CRIT
+  when: ram_tw.json.result|length==2
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.update"
+      params:
+        triggerid: "{{ (ram_tw.json.result | selectattr('description','search','HIGH') | list)[0].triggerid }}"
+        dependencies:
+          - triggerid: "{{ (ram_tw.json.result | selectattr('description','search','CRIT') | list)[0].triggerid }}"
+      auth: "{{ auth_token }}"
+      id: 2042
+
+- name: Get RAM CRIT/Swap trigger ids for dependency
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.get"
+      params:
+        output: ["triggerid","description"]
+        hostids: ["{{ use_template_id }}"]
+        filter:
+          description:
+            - "RAM utilization > {$RAM_UTIL_CRIT}% (5m)"
+            - "Swap free < {$SWAP_FREE_LOW}% (5m) (Saturation)"
+      auth: "{{ auth_token }}"
+      id: 2043
+  register: ram_swap_tw
+
+- name: Set dependency Swap depends on RAM CRIT
+  when: ram_swap_tw.json.result|length==2
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.update"
+      params:
+        triggerid: "{{ (ram_swap_tw.json.result | selectattr('description','search','Swap') | list)[0].triggerid }}"
+        dependencies:
+          - triggerid: "{{ (ram_swap_tw.json.result | selectattr('description','search','CRIT') | list)[0].triggerid }}"
+      auth: "{{ auth_token }}"
+      id: 2044
+
+- name: Create item OOM Killer events (Errors)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "OOM Killer Events (RAM Errors)"
+        key_: "use.ram.oom"
+        type: 0
+        value_type: 3
+        delay: "5m"
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "ram" }
+          - { tag: "use_type", value: "Errors" }
+        description: "Count of OOM killer events from kernel logs (journalctl -k -b). UserParameter: use.ram.oom"
+      auth: "{{ auth_token }}"
+      id: 2051
+  register: oom_item
+  failed_when: oom_item.json.error is defined and ('already exists' not in oom_item.json.error.data)
+
+- name: Create trigger OOM Killer detected (Errors)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.create"
+      params:
+        description: "OOM Killer detected (>0 events) [RAM Errors]"
+        expression: "max(/USE_Monitoring_Template/use.ram.oom,5m)>0"
+        priority: 4
+        tags:
+          - { tag: "scope", value: "USE" }
+          - { tag: "resource", value: "ram" }
+          - { tag: "use_type", value: "Errors" }
+      auth: "{{ auth_token }}"
+      id: 2052
+  failed_when: false
+
+- name: Create NET cloud items (retrans pps & established)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "TCP retransmissions, pps"
+        key_: "use.net.tcp.retrans"
+        type: 0
+        value_type: 3
+        delay: "60s"
+        delta: 1
+        units: "pps"
+        tags:
+          - { tag: "scope",    value: "USE" }
+          - { tag: "resource", value: "net" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 3021
+
+    - jsonrpc: "2.0"
+      method: "item.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "TCP established connections"
+        key_: "use.net.tcp.estab"
+        type: 0
+        value_type: 3
+        delay: "60s"
+        tags:
+          - { tag: "scope",    value: "USE" }
+          - { tag: "resource", value: "net" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 3022
+  register: net_cloud_items
+  failed_when: net_cloud_items.json.error is defined and ('already exists' not in net_cloud_items.json.error.data)
+
+- name: Create NET cloud triggers (retrans & established)
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body: "{{ item }}"
+  loop:
+    - jsonrpc: "2.0"
+      method: "trigger.create"
+      params:
+        description: "TCP retransmissions > {$NET_RETRANS_PPS} pps (5m)"
+        expression: "avg(/USE_Monitoring_Template/use.net.tcp.retrans,5m)>{$NET_RETRANS_PPS}"
+        priority: 3
+        tags:
+          - { tag: "scope",    value: "USE" }
+          - { tag: "resource", value: "net" }
+          - { tag: "use_type", value: "Saturation" }
+      auth: "{{ auth_token }}"
+      id: 3023
+
+    - jsonrpc: "2.0"
+      method: "trigger.create"
+      params:
+        description: "High number of TCP established connections (> {$NET_CONN_HIGH})"
+        expression: "last(/USE_Monitoring_Template/use.net.tcp.estab)>{$NET_CONN_HIGH}"
+        priority: 2
+        tags:
+          - { tag: "scope",    value: "USE" }
+          - { tag: "resource", value: "net" }
+          - { tag: "use_type", value: "Utilization" }
+      auth: "{{ auth_token }}"
+      id: 3024
+  register: net_cloud_triggers
+  failed_when: false
+
+- name: Create trigger for Zabbix agent unavailability
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "trigger.create"
+      params:
+        description: "Zabbix agent unavailable on {HOST.NAME}"
+        expression: "nodata(/USE_Monitoring_Template/agent.ping,3m)=1"
+        priority: 5
+        manual_close: 1
+        tags:
+          - { tag: "scope", value: "availability" }
+          - { tag: "component", value: "zabbix-agent" }             
+      auth: "{{ auth_token }}"
+      id: 2099
+  register: agent_unavail_trigger
+  failed_when: agent_unavail_trigger.json.error is defined and ('already exists' not in agent_unavail_trigger.json.error.data)

@@ -1,0 +1,353 @@
+---
+- name: Login to Zabbix API get auth token
+  uri:
+    url: "http://localhost/zabbix/api_jsonrpc.php"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "user.login"
+      params: { user: "{{ zabbix_api_user }}", password: "{{ zabbix_api_pass }}" }
+      id: 1
+    return_content: true
+    status_code: 200
+    timeout: 30
+  register: zbx_auth
+  no_log: true
+  failed_when: >
+    zbx_auth.json is not defined or
+    zbx_auth.json.result is not defined or
+    (zbx_auth.status | default(0)) != 200
+
+- name: Set common facts (auth token + API URL)
+  set_fact:
+    auth_token: "{{ zbx_auth.json.result }}"
+    zbx_api_url: "http://localhost/zabbix/api_jsonrpc.php"
+  no_log: true
+
+- name: Get USE Monitoring template id
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "template.get"
+      params:
+        filter: { host: ["USE_Monitoring_Template"] }
+        output: ["templateid","host"]
+      auth: "{{ auth_token }}"
+      id: 2
+  register: use_template
+
+- name: Fail if template not found
+  fail:
+    msg: "Template 'USE_Monitoring_Template' not found in Zabbix."
+  when: use_template.json.result | length == 0
+
+- name: Set template id fact
+  set_fact:
+    use_template_id: "{{ use_template.json.result[0].templateid }}"
+
+- name: Get template items for graphs
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        hostids: ["{{ use_template_id }}"]
+        output: ["itemid","key_","name"]
+      auth: "{{ auth_token }}"
+      id: 3
+  register: tmpl_items
+
+- name: Build key->itemid map (z_map)
+  set_fact:
+    z_map: "{{ dict(tmpl_items.json.result | map(attribute='key_') | list
+                 | zip(tmpl_items.json.result | map(attribute='itemid') | list)) }}"
+
+- name: Get itemid for web.test.fail if not in map (fallback search)
+  when: z_map['web.test.fail[WEB_ROOT,GET_/]'] is not defined
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        hostids: ["{{ use_template_id }}"]
+        output: ["itemid","key_","name"]
+        search: { key_: "*fail*" }
+        searchWildcardsEnabled: 1
+        sortfield: "name"
+        limit: 1
+      auth: "{{ auth_token }}"
+      id: 31
+  register: http_fail_get
+  changed_when: false
+
+- name: Update z_map with HTTP fail itemid (first match)
+  set_fact:
+    z_map: "{{ z_map | combine( {'web.test.fail[WEB_ROOT,GET_/]': http_fail_get.json.result[0].itemid } ) }}"
+  when: http_fail_get.json.result is defined and http_fail_get.json.result | length > 0
+
+- name: Get itemid for vfs.fs.size[/,pused] (Disk Space)
+  when: z_map['vfs.fs.size[/,pused]'] is not defined
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "item.get"
+      params:
+        hostids: ["{{ use_template_id }}"]
+        output: ["itemid","key_","name"]
+        search: { key_: "vfs.fs.size[/,pused]" }
+      auth: "{{ auth_token }}"
+      id: 32
+  register: disk_space_get
+  changed_when: false
+
+- name: Update z_map with Disk Space itemid
+  set_fact:
+    z_map: "{{ z_map | combine( {'vfs.fs.size[/,pused]': disk_space_get.json.result[0].itemid } ) }}"
+  when: disk_space_get.json.result is defined and disk_space_get.json.result | length > 0
+
+- name: Define all graphs and widgets in one list
+  set_fact:
+    graph_widget_definitions:
+      # ROW 1
+      - { name: "CPU Utilization (%)",             item_key: "use.cpu.util",                   color: "1A7C11", id: 10, x: 0,  y: 0,  width: 12, height: 6 }
+      - { name: "CPU Load Average (per-core)",     item_key: "system.cpu.load[percpu,avg1]",  color: "D63333", id: 12, x: 12, y: 0,  width: 12, height: 6 }
+      # ROW 2
+      - { name: "RAM Utilization (%)",             item_key: "use.mem.util",                   color: "F63100", id: 13, x: 0,  y: 6,  width: 12, height: 6 }
+      - { name: "RAM Swap free % (Saturation)",    item_key: "system.swap.size[,pfree]",       color: "00AA00", id: 16, x: 12, y: 6,  width: 12, height: 6 }
+      # ROW 3
+      - { name: "OOM Killer Events (RAM Errors)",  item_key: "use.ram.oom",                    color: "C80000", id: 17, x: 0,  y: 12, width: 12, height: 6 }
+      # ROW 4
+      - { name: "HTTP response time p95, ms (5m)", item_key: "use.http.time.p95[WEB_ROOT]",    color: "1A7C11", id: 14, x: 0,  y: 18, width: 12, height: 6 }
+      - { name: "HTTP check failures (Errors)",    item_key: "web.test.fail[WEB_ROOT,GET_/]",  color: "C80000", id: 18, x: 12, y: 18, width: 12, height: 6 }
+      # ROW 5 (NET cloud-native)
+      - { name: "TCP retransmissions, pps",        item_key: "use.net.tcp.retrans",            color: "F63100", id: 19, x: 0,  y: 32, width: 12, height: 6 }
+      - { name: "TCP established connections",     item_key: "use.net.tcp.estab",              color: "2774A4", id: 20, x: 12, y: 32, width: 12, height: 6 }
+
+- name: Ensure template graphs
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graph.create"
+      params:
+        hostid: "{{ use_template_id }}"
+        name: "{{ item.name }}"
+        width: 900
+        height: 200
+        gitems:
+          - itemid: "{{ z_map[item.item_key] }}"
+            color: "{{ item.color }}"
+      auth: "{{ auth_token }}"
+      id: "{{ item.id }}"
+  loop: "{{ graph_widget_definitions }}"
+  when: z_map[item.item_key] is defined
+  register: graph_create_result
+  failed_when: >
+    graph_create_result.json is defined and
+    graph_create_result.json.error is defined and
+    ('already exists' not in (graph_create_result.json.error.data | default('')))
+
+- name: Get template graph ids by names
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "graph.get"
+      params:
+        hostids: ["{{ use_template_id }}"]
+        output: ["graphid","name"]
+      auth: "{{ auth_token }}"
+      id: 21
+  register: graphs_tmpl
+
+- name: Build name->graphid map (g_map)
+  set_fact:
+    g_map: "{{ dict(graphs_tmpl.json.result | map(attribute='name') | list
+                 | zip(graphs_tmpl.json.result | map(attribute='graphid') | list)) }}"
+
+- name: Build dashboard widgets from definitions
+  set_fact:
+    widgets: "{{ (widgets | default([])) + [widget] }}"
+  vars:
+    graphid: "{{ g_map.get(item.name) | default(0) | int }}"
+    widget:
+      type: "graph"
+      name: "{{ item.name }}"
+      x: "{{ item.x }}"
+      y: "{{ item.y }}"
+      width: "{{ item.width }}"
+      height: "{{ item.height }}"
+      fields:
+        - { type: 6, name: "graphid", value: "{{ graphid | string }}" }
+  when: (graphid | int) > 0
+  loop: "{{ graph_widget_definitions }}"
+
+- name: Add Problems widget to dashboard
+  set_fact:
+    widgets: "{{ widgets | default([]) + [problems_widget] }}"
+  vars:
+    problems_widget:
+      type: "problems"
+      name: "USE Method Problems (All Resources)"
+      x: 0
+      y: 24
+      width: 24
+      height: 8
+      fields:
+        - { type: 1, name: "tags.0.tag",      value: "scope" }
+        - { type: 1, name: "tags.0.value",    value: "USE" }
+        - { type: 0, name: "tags.0.operator", value: 0 }
+        - { type: 0, name: "severities",      value: 60 }
+        - { type: 0, name: "show_timeline",   value: 1 }
+        - { type: 0, name: "show_tags",       value: 3 }
+
+- name: Create templated dashboard 'USE Overview'
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "templatedashboard.create"
+      params:
+        templateid: "{{ use_template_id }}"
+        name: "USE Overview (Brendan Gregg Method)"
+        pages:
+          - name: "USE Method: All Resources"
+            widgets: "{{ widgets | default([]) }}"
+      auth: "{{ auth_token }}"
+      id: 30
+  register: dash_tmpl
+  failed_when: >
+    dash_tmpl.json.error is defined and
+    ('already exists' not in (dash_tmpl.json.error.data | default('')))
+
+- name: Get hosts linked with USE_Monitoring_Template
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "host.get"
+      params:
+        output: ["hostid","host","name"]
+        templateids: ["{{ use_template_id }}"]
+      auth: "{{ auth_token }}"
+      id: 2081
+  register: use_hosts
+  changed_when: false
+
+- name: Select web-* hosts
+  set_fact:
+    web_hosts: "{{ use_hosts.json.result | selectattr('host','search','^web-[0-9]+(\\.|$)') | list }}"
+  changed_when: false
+
+- name: Fetch {$HTTP_ERRORS_EN} on web-* hosts
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "usermacro.get"
+      params:
+        hostids: ["{{ item.hostid }}"]
+        output: ["hostmacroid","macro","value"]
+      auth: "{{ auth_token }}"
+      id: 2082
+  loop: "{{ web_hosts }}"
+  loop_control:
+    label: "{{ item.host }}"
+    index_var: idx
+  register: web_macro_get
+  changed_when: false
+  failed_when: false
+
+- name: Ensure {$HTTP_ERRORS_EN}=1 on web-* (create if missing)
+  when: >-
+    (web_macro_get.results[idx].json.result
+     | selectattr('macro','equalto','{$HTTP_ERRORS_EN}') | list | length) == 0
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "usermacro.create"
+      params:
+        hostid: "{{ item.hostid }}"
+        macro: "{$HTTP_ERRORS_EN}"
+        value: "1"
+      auth: "{{ auth_token }}"
+      id: 2083
+  loop: "{{ web_hosts }}"
+  loop_control:
+    label: "{{ item.host }}"
+    index_var: idx
+  register: web_macro_create
+  failed_when: >
+    web_macro_create is defined and web_macro_create.results is defined and
+    (web_macro_create.results | selectattr('json.error','defined')
+     | rejectattr('json.error.data','search','already exists')
+     | list | length) > 0
+
+- name: Update {$HTTP_ERRORS_EN} to 1 on web-* if exists
+  when: >-
+    (web_macro_get.results[idx].json.result
+     | selectattr('macro','equalto','{$HTTP_ERRORS_EN}') | list | length) > 0
+    and
+    ((web_macro_get.results[idx].json.result
+      | selectattr('macro','equalto','{$HTTP_ERRORS_EN}') | list | first).value | default('')) != '1'
+  vars:
+    macro_obj: >-
+      {{
+        (web_macro_get.results[idx].json.result
+         | selectattr('macro','equalto','{$HTTP_ERRORS_EN}') | list | first)
+      }}
+  uri:
+    url: "{{ zbx_api_url }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      method: "usermacro.update"
+      params:
+        hostmacroid: "{{ macro_obj.hostmacroid }}"
+        value: "1"
+      auth: "{{ auth_token }}"
+      id: 2084
+  loop: "{{ web_hosts }}"
+  loop_control:
+    label: "{{ item.host }}"
+    index_var: idx
+
+- name: Include global yml for global dashboard
+  include_tasks: global.yml
+  when: dash_tmpl is succeeded or ('already exists' in (dash_tmpl.json.error.data | default('')))
+
+- name: Dashboard creation summary
+  debug:
+    msg:
+      - "Template: {{ use_template.json.result[0].host }} (ID {{ use_template_id }})"
+      - "Graphs created: {{ graphs_tmpl.json.result | length }}"
+      - "Widgets prepared: {{ widgets | default([]) | length }}"
+      - "Dashboard status: {{ 'OK' if (dash_tmpl.json.error is not defined) else 'Already exists' }}"
+

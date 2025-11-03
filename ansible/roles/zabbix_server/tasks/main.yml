@@ -1,0 +1,55 @@
+
+- name: Download Zabbix repository configuration package
+  apt:
+    deb: "https://repo.zabbix.com/zabbix/6.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_6.0-4+ubuntu22.04_all.deb"
+  become: yes
+
+- name: Update apt cache after adding Zabbix repository
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Zabbix Server and PostgreSQL client
+  apt:
+    name:
+      - zabbix-server-pgsql
+      - zabbix-sql-scripts
+      - postgresql-client
+    state: present
+  become: yes
+
+- name: Configure zabbix_server.conf to use Managed PostgreSQL
+  lineinfile:
+    path: /etc/zabbix/zabbix_server.conf
+    regexp: "^#? *{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+  loop:
+    - { key: 'DBHost', value: '{{ pg_fqdn }}' }
+    - { key: 'DBName', value: 'zabbix' }
+    - { key: 'DBUser', value: 'zabbix' }
+    - { key: 'DBPassword', value: '{{ db_password }}' }
+    - { key: 'DBPort', value: '6432' } 
+  notify: restart zabbix-server
+  become: yes
+
+- name: Check if Zabbix schema is already loaded
+  shell: |
+    PGPASSWORD={{ db_password }} psql -h {{ pg_fqdn }} -p 6432 -U zabbix -d zabbix -tAc "SELECT 1 FROM users LIMIT 1;"
+  register: schema_check
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Load initial Zabbix schema into Managed PostgreSQL
+  shell: |
+    zcat /usr/share/zabbix-sql-scripts/postgresql/server.sql.gz | PGPASSWORD={{ db_password }} psql -h {{ pg_fqdn }} -p 6432 -U zabbix -d zabbix
+  when: schema_check.stdout.strip() != "1"
+  become: yes
+
+- name: Ensure Zabbix server is enabled and started
+  systemd:
+    name: zabbix-server
+    enabled: yes
+    state: started
+  become: yes
+
